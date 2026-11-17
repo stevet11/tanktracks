@@ -93,6 +93,10 @@ typedef struct { Tank t; bool used, counted; int i, j, d; float tt, alert, bt; }
 static ETank ets[MAXET];
 static bool scoreOn = true;   // false while resolving enemy fire: no points for what they break
 static int etKills;
+// chain reactions: anything destroyed by a secondary explosion (a tanker, fuel tank, train tank car...) pays a bonus
+static int chainLevel;   // how many secondary explosions deep we are right now
+static int chainMult(void) { return chainLevel <= 0 ? 1 : (chainLevel >= 3 ? 4 : chainLevel + 1); }
+static const char *chainTag(void) { return chainLevel <= 0 ? "" : TextFormat("  CHAIN x%d", chainMult()); }
 
 // trains run along two east-west streets, right down the middle of the road
 #define NTSEG 7
@@ -280,8 +284,9 @@ static void killObj(Obj *o, float fx, float fz) {
     o->alive = false; o->fall = 0;
     o->tiltA = atan2f(fz, fx);
     if (scoreOn && !isClient) {
-        score += oscore[o->type]; kills[o->type]++;
-        if (oscore[o->type] >= 100) addMsg("+%d %s", oscore[o->type], oname[o->type]);
+        int pts = oscore[o->type] * chainMult();
+        score += pts; kills[o->type]++;
+        if (pts >= 100) addMsg("+%d %s%s", pts, oname[o->type], chainTag());
     }
     Vector3 c = {o->x, o->h * 0.4f, o->z};
     switch (o->type) {
@@ -331,7 +336,7 @@ static void killCar(Car *c, bool crushed) {
     if (!c->alive) return;
     c->alive = false; c->crushed = crushed;
     c->roll = rf(-0.5f, 0.5f);
-    if (scoreOn && !isClient) { score += ctypes[c->type].score; carKills++; addMsg("+%d %s %s", ctypes[c->type].score, ctypes[c->type].name, crushed ? "CRUSHED" : "DESTROYED"); }
+    if (scoreOn && !isClient) { int pts = ctypes[c->type].score * chainMult(); score += pts; carKills++; addMsg("+%d %s %s%s", pts, ctypes[c->type].name, crushed ? "CRUSHED" : "DESTROYED", chainTag()); }
     debris(c->x, 1, c->z, 25, c->col, 12);
     snd(sExp, 0.6f * vol(c->x, c->z), 1.2f);
     c->fireT = GetRandomValue(0, 10) < 7 ? rf(8, 22) : 0;
@@ -367,6 +372,7 @@ static void explode(float x, float y, float z, float radius, float dmg, bool she
     shake += Clamp(radius * 0.03f, 0.1f, 1.0f) * vol(x, z);
     if (y < 4 && radius >= 6) { craters[ncrater++ % 120] = (Crater){x, z, radius * 0.45f}; }
     if (dmg <= 0) return;
+    if (!shell) chainLevel++;   // everything this blast destroys counts as a chain reaction
     int cnt = query(x, z, radius + 30);
     for (int k = 0; k < cnt; k++) {
         Obj *o = &objs[qbuf[k]];
@@ -402,6 +408,7 @@ static void explode(float x, float y, float z, float radius, float dmg, bool she
         float de = hypotf(e->t.x - x, e->t.z - z);
         if (de < radius + 2 && (!shell || scoreOn)) damageET(e, dmg * (shell ? 0.5f : 0.3f) * (1 - de / (radius + 2)));
     }
+    if (!shell) chainLevel--;
 }
 
 // ---------------------------------------------------------------- world generation
@@ -755,7 +762,7 @@ static void damageET(ETank *e, float d) {
     e->t.hp -= d; e->alert = 20;
     if (e->t.hp <= 0) {
         e->t.dead = true; e->t.spd = 0;
-        if (scoreOn && !isClient) { score += 500; etKills++; addMsg("+500 ENEMY TANK DESTROYED"); }
+        if (scoreOn && !isClient) { int pts = 500 * chainMult(); score += pts; etKills++; addMsg("+%d ENEMY TANK DESTROYED%s", pts, chainTag()); }
         explode(e->t.x, 1.5f, e->t.z, 10, 0, false);
         addEmit((Vector3){e->t.x, 1.5f, e->t.z}, 25, 0);
         debris(e->t.x, 2, e->t.z, 30, (Color){70, 80, 60, 255}, 16);
@@ -862,7 +869,7 @@ static void damageSeg(Train *t, int k, float d) {
     float x = segX(t, k);
     g->alive = false; g->wx = x; g->wz = t->z; g->moving = false;
     int pts = g->kind == 0 ? 400 : g->kind == 2 ? 300 : 200;
-    if (scoreOn && !isClient) { score += pts; addMsg("+%d %s", pts, g->kind == 0 ? "LOCOMOTIVE" : g->kind == 2 ? "TANK CAR" : "TRAIN CAR"); }
+    if (scoreOn && !isClient) { pts *= chainMult(); score += pts; addMsg("+%d %s%s", pts, g->kind == 0 ? "LOCOMOTIVE" : g->kind == 2 ? "TANK CAR" : "TRAIN CAR", chainTag()); }
     debris(x, 2, t->z, 40, g->kind == 1 ? (Color){125, 70, 50, 255} : (Color){70, 70, 78, 255}, 15);
     addEmit((Vector3){x, 1.5f, t->z}, 25, 0);
     if (g->kind == 2) explode(x, 2, t->z, 22, 240, false);
@@ -2027,7 +2034,7 @@ int main(int argc, char **argv) {
         float ad = hypotf(aimPt.x - tank.x, aimPt.z - tank.z);
         if (ad > 360) { aimPt.x = tank.x + (aimPt.x - tank.x) * 360 / ad; aimPt.z = tank.z + (aimPt.z - tank.z) * 360 / ad; }
         if (demo) {   // scripted run for screenshots: drive forward and shell whatever is ahead
-            aimPt = (Vector3){tank.x + sinf(tank.h + (getenv("TT_TRAIN") ? 0.0f : 0.35f)) * 45, 0.3f, tank.z + cosf(tank.h + (getenv("TT_TRAIN") ? 0.0f : 0.35f)) * 45};
+            aimPt = (Vector3){tank.x + sinf(tank.h + ((getenv("TT_TRAIN") || getenv("TT_TYPE")) ? 0.0f : 0.35f)) * 45, 0.3f, tank.z + cosf(tank.h + ((getenv("TT_TRAIN") || getenv("TT_TYPE")) ? 0.0f : 0.35f)) * 45};
         }
         if (getenv("TT_AUTO")) {   // test hook: drive forward and fire the cannon every other second
             in->thr = 1; in->steer = atoi(getenv("TT_AUTO")) > 1 ? 0.3f : 0; in->cannon = (frame / 60) % 2;

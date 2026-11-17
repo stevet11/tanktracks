@@ -28,6 +28,10 @@ Wrecked cars, buses, trucks, tankers and enemy tank wrecks can be shoved aside t
 and tankers are too heavy to squash: you push them (small cars still get flattened).
 Traffic brakes for tanks, trains and wrecks, and turns around if it stays blocked for 10 seconds.
 
+## Chain reactions
+Anything destroyed by a secondary explosion (a fuel tank, tanker, train tank car or exploding wreck) pays a
+bonus: x2 for the first link in the chain, x3 for the next, up to x4. The message shows e.g. `+400 HOUSE  CHAIN x4`.
+
 ## Enemy tanks
 Five red enemy tanks patrol the roads. Within ~110 units they spot you, hunt you down the road grid,
 hold at ~70 units and lead their shots. They die to ~3 cannon hits (500 points each); their shells
