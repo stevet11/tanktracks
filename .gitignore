@@ -1,0 +1,9 @@
+build/
+tanktracks
+tanktracks.exe
+*.sav
+tanktracks.log
+shot.png
+*.o
+third_party/
+NEXT.md
