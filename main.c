@@ -1569,11 +1569,11 @@ static void drawHUD(int W, int H) {
         DrawTriangle(a, c, b, p == me ? WHITE : pcol[p]);
     }
     // crosshair at the mouse
-    Vector2 m = GetMousePosition();
+    Vector2 m = getenv("TT_NOFPS") ? GetWorldToScreen(inp[me].aim, gcam) : GetMousePosition();   // screenshot runs have no mouse
     DrawCircleLines((int)m.x, (int)m.y, 12, (Color){255, 255, 255, 220});
     DrawLine((int)m.x - 18, (int)m.y, (int)m.x - 6, (int)m.y, WHITE); DrawLine((int)m.x + 6, (int)m.y, (int)m.x + 18, (int)m.y, WHITE);
     DrawLine((int)m.x, (int)m.y - 18, (int)m.x, (int)m.y - 6, WHITE); DrawLine((int)m.x, (int)m.y + 6, (int)m.x, (int)m.y + 18, WHITE);
-    if (gameT < 12 && !tank.dead) {
+    if (gameT < 12 && !tank.dead && !getenv("TT_NOFPS")) {
         const char *h = netMode == M_SINGLE ? "W/S drive   A/D turn   Mouse aim   LMB cannon   RMB / Ctrl machine gun   Q/E look, C recenter, wheel zoom   R restart   P pause" : "W/S drive   A/D turn   Mouse aim   LMB cannon   RMB / Ctrl machine gun   Q/E look, C recenter, wheel zoom";
         DrawText(h, W / 2 - MeasureText(h, 18) / 2, H - 100, 18, (Color){255, 255, 255, (unsigned char)(255 * Clamp(12 - gameT, 0, 1))});
     }
@@ -1950,7 +1950,7 @@ int main(int argc, char **argv) {
         if (!strcmp(argv[i], "--host")) { if (startHost(i + 1 < argc && atoi(argv[i + 1]) > 0 ? atoi(argv[i + 1]) : NET_PORT)) phase = PH_PLAY; else snprintf(menuMsg, sizeof menuMsg, "Could not start the host"); }
         else if (!strcmp(argv[i], "--join") && i + 1 < argc) { if (startJoin(argv[i + 1])) phase = PH_CONNECT; else snprintf(menuMsg, sizeof menuMsg, "Could not connect"); }
     }
-    if ((shotPath || demo) && netMode == M_SINGLE) phase = PH_PLAY;
+    if ((shotPath || demo) && netMode == M_SINGLE && !getenv("TT_MENU")) phase = PH_PLAY;
     if (phase == PH_PLAY) HideCursor();
     if (getenv("TT_TYPE")) {   // test hook: park the tank 40 units south of the first object of this type
         int ty = atoi(getenv("TT_TYPE"));
@@ -1994,6 +1994,7 @@ int main(int argc, char **argv) {
             BeginDrawing();
             drawMenu(phase, ip, phase == PH_CONNECT ? netStatus : menuMsg);
             EndDrawing();
+            if (getenv("TT_MENU") && shotPath && ++frame == 20) { TakeScreenshot(shotPath); break; }
             continue;
         }
         cur = me;

@@ -8,23 +8,12 @@ on:
   workflow_dispatch:
 
 jobs:
-  build:
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - os: ubuntu-22.04
-            name: linux-x64
-            bin: build/tanktracks
-          - os: windows-latest
-            name: windows-x64
-            bin: build/Release/tanktracks.exe
-    runs-on: ${{ matrix.os }}
+  linux:
+    runs-on: ubuntu-22.04
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install Linux dependencies
-        if: runner.os == 'Linux'
+      - name: Install dependencies
         run: |
           sudo apt-get update
           sudo apt-get install -y libx11-dev libxrandr-dev libxinerama-dev libxcursor-dev libxi-dev libgl1-mesa-dev
@@ -33,27 +22,47 @@ jobs:
         run: cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
 
       - name: Build
-        run: cmake --build build --config Release
+        run: cmake --build build -j
 
       - name: Package
-        shell: bash
         run: |
           mkdir dist
-          cp "${{ matrix.bin }}" README.md LICENSE dist/
-          if [ "$RUNNER_OS" = "Windows" ]; then
-            7z a "tanktracks-${{ matrix.name }}.zip" ./dist/*
-          else
-            tar -czf "tanktracks-${{ matrix.name }}.tar.gz" -C dist .
-          fi
+          cp build/tanktracks README.md LICENSE dist/
+          tar -czf tanktracks-linux-x64.tar.gz -C dist .
 
       - uses: actions/upload-artifact@v4
         with:
-          name: tanktracks-${{ matrix.name }}
-          path: tanktracks-${{ matrix.name }}.*
+          name: tanktracks-linux-x64
+          path: tanktracks-linux-x64.tar.gz
+
+  # The Windows .exe is cross-compiled with mingw-w64 (same as `make windows` locally); no Windows runner needed.
+  windows:
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y mingw-w64 zip
+
+      - name: Build
+        run: make windows
+
+      - name: Package
+        run: |
+          mkdir dist
+          cp tanktracks.exe README.md LICENSE dist/
+          (cd dist && zip -q ../tanktracks-windows-x64.zip *)
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: tanktracks-windows-x64
+          path: tanktracks-windows-x64.zip
 
   release:
     if: startsWith(github.ref, 'refs/tags/v')
-    needs: build
+    needs: [linux, windows]
     runs-on: ubuntu-latest
     permissions:
       contents: write

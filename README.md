@@ -1,14 +1,30 @@
 # TANK TRACKS
-Drive a tank through a city and shoot everything. C + raylib 5.5. Linux and Windows.
+Drive a tank through a city and shoot everything. C + raylib 5.5. Linux and Windows. 2-4 player co-op.
+
+![City](screenshots/city.png)
+![Chain reaction](screenshots/chain-reaction.png)
+
+| Enemy tank | Trains | Co-op |
+|---|---|---|
+| ![Enemy tank](screenshots/enemy-tank.png) | ![Train](screenshots/train.png) | ![Co-op](screenshots/coop.png) |
+
+| Title screen | Billboards, water towers and trains |
+|---|---|
+| ![Title](screenshots/title.png) | ![Billboard](screenshots/billboard.png) |
+
 Same engine and build setup as ironroad (`main.c` plus a small `net.c`, no asset files, sound is synthesized).
 2-4 player co-op over the network (ENet).
+
+## Download
+Prebuilt Linux and Windows binaries are attached to each release (and to every CI run as artifacts).
 
 ## Build
 ```
 make && ./tanktracks
 ```
 or `cmake -S . -B build -DCMAKE_BUILD_TYPE=Release && cmake --build build`. raylib and ENet are taken from
-`third_party/` if present, otherwise downloaded.
+`third_party/` if present, otherwise downloaded. `make windows` cross-builds `tanktracks.exe` from Linux
+(needs mingw-w64).
 
 ## Controls
 W/S drive, A/D turn, mouse aims the turret (the cannon shell lands on the red ring),
