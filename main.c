@@ -7,6 +7,8 @@
 #include <stdlib.h>
 #include <stdarg.h>
 #include <string.h>
+#include <stdint.h>
+#include "net.h"
 
 // ---------------------------------------------------------------- world constants
 #define N 9                    // blocks per side
@@ -71,8 +73,19 @@ typedef struct { float x, z, r; } Crater;
 static Crater craters[120];
 static int ncrater;
 
-typedef struct { float x, z, h, spd, tur, pitch, hp, reload, mgT, odo, recoil; bool dead; } Tank;
-static Tank tank;
+typedef struct { float x, z, h, spd, tur, pitch, hp, reload, mgT, odo, recoil; bool dead, mgOn; } Tank;
+// up to 4 tanks: players[]. `cur` is the player being processed right now (the code below says `tank` for it);
+// `me` is the player sitting at this keyboard.
+#define MAXP 4
+static Tank players[MAXP];
+static bool pactive[MAXP];
+static float respawnT[MAXP];
+static int cur, me;
+#define tank (players[cur])
+typedef struct { float thr, steer; bool brake, cannon, mg; Vector3 aim; } Input;
+static Input inp[MAXP];
+#define aimPt (inp[cur].aim)
+static const Color pcol[MAXP] = {{78, 92, 56, 255}, {62, 92, 150, 255}, {160, 128, 50, 255}, {128, 70, 140, 255}};
 #define TANK_HP 600
 #define ET_HP 220
 #define MAXET 8
@@ -103,10 +116,40 @@ static char msgs[6][64];
 static float msgT[6];
 static float shake, gameT;
 static float camYaw, camOff, camDist = 26;
-static Vector3 aimPt;
 static bool paused, audioOK;
 static unsigned char blockKind[N][N];
 static Sound sHorn, sCannon, sMG, sExp, sCrunch, sEng, sPick;
+
+
+// ---------------------------------------------------------------- network plumbing (protocol is in the networking section below)
+// One machine hosts: it runs the whole simulation. Clients send their controls and draw what the host reports.
+enum { M_SINGLE, M_HOST, M_CLIENT };
+static int netMode = M_SINGLE;
+#define isClient (netMode == M_CLIENT)
+#define isHost (netMode == M_HOST)
+static bool netApplying;   // a client is replaying a host event (explosions etc. only happen on a client then)
+#define NET_VER 1
+#define NET_PORT 7777
+enum { P_HELLO = 1, P_INPUT = 2, P_WELCOME = 10, P_SNAPA = 11, P_SNAPB = 12, P_SNAPC = 13, P_REJECT = 14, P_EVENT = 20 };
+enum { EV_EXPLODE = 1, EV_OBJKILL, EV_EMIT, EV_MSG, EV_FIRE, EV_RESTART };
+typedef struct { unsigned char *b; int n, cap; } Wr;
+static void w8(Wr *w, int v) { if (w->n < w->cap) w->b[w->n++] = (unsigned char)v; }
+static void w16(Wr *w, int v) { w8(w, v & 255); w8(w, (v >> 8) & 255); }
+static void w32(Wr *w, unsigned v) { w16(w, (int)(v & 0xffff)); w16(w, (int)(v >> 16)); }
+static void wf(Wr *w, float f) { unsigned u; memcpy(&u, &f, 4); w32(w, u); }
+typedef struct { const unsigned char *b; int n, len; } Rd;
+static int r8(Rd *r) { return r->n < r->len ? r->b[r->n++] : 0; }
+static int r16(Rd *r) { int a = r8(r); int b = r8(r); return a | (b << 8); }
+static unsigned r32(Rd *r) { unsigned a = (unsigned)r16(r); unsigned b = (unsigned)r16(r); return a | (b << 16); }
+static float rdf(Rd *r) { unsigned u = r32(r); float f; memcpy(&f, &u, 4); return f; }
+#define EVBEGIN(t) unsigned char evb[128]; Wr ew = {evb, 0, sizeof evb}; w8(&ew, P_EVENT); w8(&ew, t)
+#define EVSEND net_broadcast(1, true, evb, ew.n)
+static void evExplode(float x, float y, float z, float r, bool shell) { EVBEGIN(EV_EXPLODE); wf(&ew, x); wf(&ew, y); wf(&ew, z); wf(&ew, r); w8(&ew, shell); EVSEND; }
+static void evObjKill(int idx, float fx, float fz) { EVBEGIN(EV_OBJKILL); w16(&ew, idx); wf(&ew, fx); wf(&ew, fz); EVSEND; }
+static void evEmit(Vector3 p, float dur, int kind) { EVBEGIN(EV_EMIT); wf(&ew, p.x); wf(&ew, p.y); wf(&ew, p.z); wf(&ew, dur); w8(&ew, kind); EVSEND; }
+static void evMsg(const char *m) { EVBEGIN(EV_MSG); int n = (int)strlen(m); if (n > 60) n = 60; w8(&ew, n); for (int i = 0; i < n; i++) w8(&ew, m[i]); EVSEND; }
+static void evFire(int kind, Vector3 m, float yaw) { EVBEGIN(EV_FIRE); w8(&ew, kind); wf(&ew, m.x); wf(&ew, m.y); wf(&ew, m.z); wf(&ew, yaw); EVSEND; }
+static void evRestart(void) { EVBEGIN(EV_RESTART); EVSEND; }
 
 // ---------------------------------------------------------------- helpers
 static float rf(float a, float b) { return a + (b - a) * (GetRandomValue(0, 10000) / 10000.0f); }
@@ -124,6 +167,7 @@ static void addMsg(const char *fmt, ...) {
     for (int i = 5; i > 0; i--) { memcpy(msgs[i], msgs[i - 1], 64); msgT[i] = msgT[i - 1]; }
     va_list a; va_start(a, fmt); vsnprintf(msgs[0], 64, fmt, a); va_end(a);
     msgT[0] = 4;
+    if (isHost) evMsg(msgs[0]);
 }
 static float nodeX(int i) { return (i - N / 2.0f) * S; }
 static float blockC(int i) { return (i + 0.5f - N / 2.0f) * S; }
@@ -162,7 +206,7 @@ static void snd(Sound s, float vol, float pitch) {
     if (!audioOK) return;
     SetSoundVolume(s, vol); SetSoundPitch(s, pitch); PlaySound(s);
 }
-static float distToTank(float x, float z) { return hypotf(x - tank.x, z - tank.z); }
+static float distToTank(float x, float z) { return hypotf(x - players[me].x, z - players[me].z); }   // distance to the local player
 static float vol(float x, float z) { return Clamp(1.2f - distToTank(x, z) / 220.0f, 0.05f, 1.0f); }
 
 // ---------------------------------------------------------------- particles
@@ -181,6 +225,8 @@ static void debris(float x, float y, float z, int n, Color c, float spd) {
     }
 }
 static void addEmit(Vector3 p, float dur, int kind) {
+    if (isClient && !netApplying) return;   // the host tells us when to start a fire
+    if (isHost) evEmit(p, dur, kind);
     for (int i = 0; i < MAXEMIT; i++) if (emits[i].t <= 0) { emits[i] = (Emit){p, dur, dur, kind}; return; }
 }
 
@@ -230,9 +276,10 @@ static void damageSeg(Train *t, int k, float d);
 static const float ohp[O_NTYPES] = {140, 450, 25, 12, 18, 40, 15, 10, 150, 60};
 
 static void killObj(Obj *o, float fx, float fz) {
+    if (isHost) evObjKill((int)(o - objs), fx, fz);
     o->alive = false; o->fall = 0;
     o->tiltA = atan2f(fz, fx);
-    if (scoreOn) {
+    if (scoreOn && !isClient) {
         score += oscore[o->type]; kills[o->type]++;
         if (oscore[o->type] >= 100) addMsg("+%d %s", oscore[o->type], oname[o->type]);
     }
@@ -284,7 +331,7 @@ static void killCar(Car *c, bool crushed) {
     if (!c->alive) return;
     c->alive = false; c->crushed = crushed;
     c->roll = rf(-0.5f, 0.5f);
-    if (scoreOn) { score += ctypes[c->type].score; carKills++; addMsg("+%d %s %s", ctypes[c->type].score, ctypes[c->type].name, crushed ? "CRUSHED" : "DESTROYED"); }
+    if (scoreOn && !isClient) { score += ctypes[c->type].score; carKills++; addMsg("+%d %s %s", ctypes[c->type].score, ctypes[c->type].name, crushed ? "CRUSHED" : "DESTROYED"); }
     debris(c->x, 1, c->z, 25, c->col, 12);
     snd(sExp, 0.6f * vol(c->x, c->z), 1.2f);
     c->fireT = GetRandomValue(0, 10) < 7 ? rf(8, 22) : 0;
@@ -302,9 +349,11 @@ static void dmgCar(Car *c, float d) {
 static void damageTank(float d) {
     if (tank.dead) return;
     tank.hp -= d; shake += 0.2f;
-    if (tank.hp <= 0) { tank.dead = true; tank.spd = 0; explode(tank.x, 1.5f, tank.z, 10, 0, false); addEmit((Vector3){tank.x, 1.5f, tank.z}, 20, 0); }
+    if (tank.hp <= 0) { tank.dead = true; tank.spd = 0; respawnT[cur] = 6; explode(tank.x, 1.5f, tank.z, 10, 0, false); addEmit((Vector3){tank.x, 1.5f, tank.z}, 20, 0); }
 }
 static void explode(float x, float y, float z, float radius, float dmg, bool shell) {
+    if (isClient && !netApplying) return;   // clients only show explosions the host reports
+    if (isHost) evExplode(x, y, z, radius, shell);
     int n = (int)(18 + radius * 3);
     for (int i = 0; i < n; i++) {
         Vector3 v = Vector3Scale(Vector3Normalize((Vector3){rf(-1, 1), rf(0.1f, 1.3f), rf(-1, 1)}), rf(3, 10 + radius));
@@ -337,8 +386,16 @@ static void explode(float x, float y, float z, float radius, float dmg, bool she
         float ds = hypotf(segX(tr, k) - x, segZ(tr, k) - z);
         if (ds < radius + 3) damageSeg(tr, k, dmg * (1 - ds / (radius + 3) * 0.6f));
     }
-    float d = distToTank(x, z);
-    if (d < radius + 2 && dmg > 0) damageTank(dmg * ((shell && !scoreOn) ? 0.3f : 0.15f) * (1 - d / (radius + 2)));
+    if (dmg > 0) {
+        int sv = cur;
+        for (int p = 0; p < MAXP; p++) {
+            if (!pactive[p] || players[p].dead) continue;
+            cur = p;
+            float d = hypotf(x - tank.x, z - tank.z);
+            if (d < radius + 2) damageTank(dmg * ((shell && !scoreOn) ? 0.3f : 0.15f) * (1 - d / (radius + 2)));
+        }
+        cur = sv;
+    }
     for (int i = 0; i < MAXET; i++) {
         ETank *e = &ets[i];
         if (!e->used || e->t.dead) continue;
@@ -377,6 +434,12 @@ static void lotFence(float lx, float lz, float half, int gateFace) {
         }
         addObj(O_FENCE, x, z, step * 0.96f, 0.3f, 1.3f, face, (Color){235, 232, 220, 255});
     }
+}
+static void spawnPlayer(int p) {
+    Tank *t = &players[p];
+    memset(t, 0, sizeof(*t));
+    t->x = nodeX(4) + (p % 2 ? 3.5f : -3.5f); t->z = nodeX(1) - (p / 2) * 10.0f; t->hp = TANK_HP;
+    respawnT[p] = 0;
 }
 static void genWorld(void) {
     nobj = 0; memset(cars, 0, sizeof(cars)); memset(proj, 0, sizeof(proj)); memset(parts, 0, sizeof(parts));
@@ -471,7 +534,7 @@ static void genWorld(void) {
         static const int kinds[NTSEG] = {0, 1, 2, 3, 1, 2, 3};
         for (int k = 0; k < NTSEG; k++) t->seg[k] = (Seg){true, true, k == 0 ? 320 : 170, 0, 0, t->s - k * TLEN, rf(0, 0.1f), kinds[k]};
     }
-    memset(&tank, 0, sizeof(tank));
+    memset(players, 0, sizeof(players));
     memset(ets, 0, sizeof(ets)); etKills = 0; scoreOn = true;
     for (int k = 0; k < 5; k++) {
         ETank *e = &ets[k];
@@ -490,7 +553,8 @@ static void genWorld(void) {
         e->t.x = nodeX(e->i); e->t.z = nodeX(e->j); e->t.hp = ET_HP; e->t.reload = rf(4, 7);
         e->t.h = e->t.tur = e->d == 0 ? PI / 2 : e->d == 1 ? 0 : e->d == 2 ? -PI / 2 : PI;
     }
-    tank.x = nodeX(4); tank.z = nodeX(1); tank.hp = TANK_HP; tank.h = 0; tank.tur = 0;
+    for (int p = 0; p < MAXP; p++) { cur = p; spawnPlayer(p); }
+    cur = me;
     camYaw = 0; camOff = 0;
     score = 0; carKills = 0; memset(kills, 0, sizeof(kills)); gameT = 0;
 }
@@ -502,10 +566,24 @@ static void carTarget(Car *c, float *tx, float *tz) {
     *tx = ax + (bx - ax) * c->t + dzs[c->d] * 3.4f;
     *tz = az + (bz - az) * c->t - dxs[c->d] * 3.4f;
 }
+static void deadCarFx(Car *c, float dt) {   // burning wrecks: smoke, and the occasional explosion
+    if (c->fireT > 0) {
+        c->fireT -= dt; c->bt -= dt;
+        if (c->bt <= 0) {
+            c->bt = 0.07f;
+            part((Vector3){c->x + rf(-.8f, .8f), 1.2f, c->z + rf(-.8f, .8f)}, (Vector3){rf(-.5f, .5f), rf(2, 4), rf(-.5f, .5f)}, rf(.6f, 1.2f), rf(.5f, 1), (Color){255, 150, 30, 220}, 0, -.4f, true);
+            part((Vector3){c->x, 1.6f, c->z}, (Vector3){rf(-.6f, .6f), rf(2, 3.5f), rf(-.6f, .6f)}, rf(1.5f, 3), rf(.8f, 1.4f), (Color){50, 50, 50, 170}, 0, 1.2f, true);
+        }
+    }
+    if (c->boomT > 0) { c->boomT -= dt; if (c->boomT <= 0) { if (c->type == CT_TANKER) explode(c->x, 1.5f, c->z, 22, 240, false); else explode(c->x, 1.2f, c->z, 9, 90, false); c->fireT = 0; c->roll = rf(-1.2f, 1.2f); } }
+}
 // is there something solid at this spot that a driver would not want to plough into?
-static bool carBlockedAt(Car *me, float px, float pz) {
-    float fx = sinf(tank.h), fz = cosf(tank.h);
-    for (int s = -1; s <= 1; s += 2) if (hypotf(px - (tank.x + fx * 2.0f * s), pz - (tank.z + fz * 2.0f * s)) < TANK_R + 1.3f) return true;
+static bool carBlockedAt(Car *self, float px, float pz) {
+    for (int p = 0; p < MAXP; p++) {
+        if (!pactive[p]) continue;
+        float fx = sinf(players[p].h), fz = cosf(players[p].h);
+        for (int s = -1; s <= 1; s += 2) if (hypotf(px - (players[p].x + fx * 2.0f * s), pz - (players[p].z + fz * 2.0f * s)) < TANK_R + 1.3f) return true;
+    }
     for (int i = 0; i < MAXET; i++) {
         ETank *e = &ets[i];
         if (!e->used) continue;
@@ -520,8 +598,8 @@ static bool carBlockedAt(Car *me, float px, float pz) {
     }
     for (int j = 0; j < MAXCAR; j++) {
         Car *o = &cars[j];
-        if (o == me || (o->x == 0 && o->z == 0)) continue;
-        if ((!o->alive || o->d == me->d) && hypotf(px - o->x, pz - o->z) < ctypes[o->type].rad + 1.0f) return true;
+        if (o == self || (o->x == 0 && o->z == 0)) continue;
+        if ((!o->alive || o->d == self->d) && hypotf(px - o->x, pz - o->z) < ctypes[o->type].rad + 1.0f) return true;
     }
     return false;
 }
@@ -529,18 +607,7 @@ static void updateCars(float dt) {
     static const int dxs[4] = {1, 0, -1, 0}, dzs[4] = {0, 1, 0, -1};
     for (int k = 0; k < MAXCAR; k++) {
         Car *c = &cars[k];
-        if (!c->alive) {
-            if (c->fireT > 0) {
-                c->fireT -= dt; c->bt -= dt;
-                if (c->bt <= 0) {
-                    c->bt = 0.07f;
-                    part((Vector3){c->x + rf(-.8f, .8f), 1.2f, c->z + rf(-.8f, .8f)}, (Vector3){rf(-.5f, .5f), rf(2, 4), rf(-.5f, .5f)}, rf(.6f, 1.2f), rf(.5f, 1), (Color){255, 150, 30, 220}, 0, -.4f, true);
-                    part((Vector3){c->x, 1.6f, c->z}, (Vector3){rf(-.6f, .6f), rf(2, 3.5f), rf(-.6f, .6f)}, rf(1.5f, 3), rf(.8f, 1.4f), (Color){50, 50, 50, 170}, 0, 1.2f, true);
-                }
-            }
-            if (c->boomT > 0) { c->boomT -= dt; if (c->boomT <= 0) { if (c->type == CT_TANKER) explode(c->x, 1.5f, c->z, 22, 240, false); else explode(c->x, 1.2f, c->z, 9, 90, false); c->fireT = 0; c->roll = rf(-1.2f, 1.2f); } }
-            continue;
-        }
+        if (!c->alive) { deadCarFx(c, dt); continue; }
         c->panic = fmaxf(0, c->panic - dt);
         {   // look down the road and brake for anything in the way; give up and turn around if it stays blocked
             static const float samp[5] = {5, 9, 13, 18, 24}, tgt[5] = {0, 0, 0.35f, 0.6f, 0.85f};
@@ -574,9 +641,12 @@ static void updateCars(float dt) {
         float vx = c->x - px, vz = c->z - pz;
         if (vx * vx + vz * vz > 1e-6f) c->h += angDiff(c->h, atan2f(vx, vz)) * fminf(1, 8 * dt);
         // small cars get squashed by the tank; big vehicles are shoved aside instead (see vehiclesCollide)
-        if (c->type < CT_BUS) for (int s = -1; s <= 1; s += 2) {
-            float cx = tank.x + sinf(tank.h) * 2.0f * s, cz = tank.z + cosf(tank.h) * 2.0f * s;
-            if (hypotf(c->x - cx, c->z - cz) < TANK_R + ctypes[c->type].rad * 0.95f) { killCar(c, true); break; }
+        if (c->type < CT_BUS) for (int p = 0; p < MAXP && c->alive; p++) {
+            if (!pactive[p] || players[p].dead) continue;
+            for (int s = -1; s <= 1; s += 2) {
+                float cx = players[p].x + sinf(players[p].h) * 2.0f * s, cz = players[p].z + cosf(players[p].h) * 2.0f * s;
+                if (hypotf(c->x - cx, c->z - cz) < TANK_R + ctypes[c->type].rad * 0.95f) { killCar(c, true); break; }
+            }
         }
     }
 }
@@ -593,6 +663,7 @@ static void fireShell(void) {
     Vector3 v = {sinf(tank.tur) * cosf(th) * SHELL_V, sinf(th) * SHELL_V, cosf(tank.tur) * cosf(th) * SHELL_V};
     for (int i = 0; i < MAXPROJ; i++) if (!proj[i].on) { proj[i] = (Proj){true, 0, m, v, 6}; break; }
     tank.reload = 1.3f; tank.recoil = 1;
+    if (isHost) evFire(0, m, tank.tur);
     snd(sCannon, 0.9f, rf(0.95f, 1.05f));
     shake += 0.25f;
     for (int i = 0; i < 14; i++)
@@ -613,12 +684,11 @@ static void trainCollide(float dt);
 static void vehiclesCollide(float dt);
 static void updateTank(float dt) {
     Tank *t = &tank;
-    if (t->dead) { t->spd *= 1 - 3 * dt; return; }
-    float thr = (IsKeyDown(KEY_W) || IsKeyDown(KEY_UP) ? 1 : 0) - (IsKeyDown(KEY_S) || IsKeyDown(KEY_DOWN) ? 1 : 0);
-    float st = (IsKeyDown(KEY_A) || IsKeyDown(KEY_LEFT) ? 1 : 0) - (IsKeyDown(KEY_D) || IsKeyDown(KEY_RIGHT) ? 1 : 0);
+    if (t->dead) { t->spd *= 1 - 3 * dt; t->mgOn = false; return; }
+    float thr = Clamp(inp[cur].thr, -1, 1), st = Clamp(inp[cur].steer, -1, 1);
     if (thr != 0) t->spd += thr * (thr * t->spd < 0 ? 40 : 14) * dt;
     else t->spd -= Clamp(t->spd, -8 * dt, 8 * dt);
-    if (IsKeyDown(KEY_SPACE) && thr == 0) t->spd *= 1 - 6 * dt;
+    if (inp[cur].brake && thr == 0) t->spd *= 1 - 6 * dt;
     t->spd = Clamp(t->spd, -7, 16);
     t->h += st * 1.35f * dt;
     float fx = sinf(t->h), fz = cosf(t->h);
@@ -652,6 +722,11 @@ static void updateTank(float dt) {
             }
         }
     }
+    for (int p = 0; p < MAXP; p++) {   // tanks can't drive through each other
+        if (p == cur || !pactive[p] || players[p].dead) continue;
+        float dx = t->x - players[p].x, dz = t->z - players[p].z, dd = hypotf(dx, dz);
+        if (dd < 5.2f && dd > 1e-3f) { t->x += dx / dd * (5.2f - dd) * 0.5f; t->z += dz / dd * (5.2f - dd) * 0.5f; players[p].x -= dx / dd * (5.2f - dd) * 0.5f; players[p].z -= dz / dd * (5.2f - dd) * 0.5f; }
+    }
     trainCollide(dt);
     vehiclesCollide(dt);
     float lim = HALFW + ROAD / 2 - 3;
@@ -664,8 +739,9 @@ static void updateTank(float dt) {
     float wp = 0.5f * asinf(Clamp(GRAV * d / (SHELL_V * SHELL_V), 0, 1));
     t->pitch += (wp - t->pitch) * fminf(1, 6 * dt);
     t->reload -= dt; t->mgT -= dt; t->recoil = fmaxf(0, t->recoil - 4 * dt);
-    if (IsMouseButtonDown(MOUSE_BUTTON_LEFT) && t->reload <= 0) fireShell();
-    if ((IsMouseButtonDown(MOUSE_BUTTON_RIGHT) || IsKeyDown(KEY_LEFT_CONTROL)) && t->mgT <= 0) fireMG();
+    if (inp[cur].cannon && t->reload <= 0) fireShell();
+    t->mgOn = inp[cur].mg;
+    if (inp[cur].mg && t->mgT <= 0) fireMG();
     // dust
     if (fabsf(t->spd) > 3 && GetRandomValue(0, 3) == 0)
         part((Vector3){t->x - fx * 3.4f * (t->spd > 0 ? 1 : -1) + rf(-1.5f, 1.5f), 0.3f, t->z - fz * 3.4f * (t->spd > 0 ? 1 : -1)}, (Vector3){rf(-.5f, .5f), rf(.5f, 1.5f), rf(-.5f, .5f)}, rf(.6f, 1.2f), rf(.6f, 1.2f), (Color){170, 160, 140, 110}, 0, 1.5f, true);
@@ -679,7 +755,7 @@ static void damageET(ETank *e, float d) {
     e->t.hp -= d; e->alert = 20;
     if (e->t.hp <= 0) {
         e->t.dead = true; e->t.spd = 0;
-        if (scoreOn) { score += 500; etKills++; addMsg("+500 ENEMY TANK DESTROYED"); }
+        if (scoreOn && !isClient) { score += 500; etKills++; addMsg("+500 ENEMY TANK DESTROYED"); }
         explode(e->t.x, 1.5f, e->t.z, 10, 0, false);
         addEmit((Vector3){e->t.x, 1.5f, e->t.z}, 25, 0);
         debris(e->t.x, 2, e->t.z, 30, (Color){70, 80, 60, 255}, 16);
@@ -697,6 +773,7 @@ static void fireEnemy(ETank *e) {
     Vector3 v = {sinf(yaw) * cosf(th) * SHELL_V, sinf(th) * SHELL_V, cosf(yaw) * cosf(th) * SHELL_V};
     for (int i = 0; i < MAXPROJ; i++) if (!proj[i].on) { proj[i] = (Proj){true, 0, m, v, 6, 1}; break; }
     t->reload = rf(4.5f, 6.5f); t->recoil = 1; enemyCool = 1.8f;
+    if (isHost) evFire(1, m, t->tur);
     snd(sCannon, 0.8f * vol(m.x, m.z), rf(0.85f, 0.95f));
     for (int i = 0; i < 10; i++)
         part(m, (Vector3){sinf(t->tur) * rf(4, 12) + rf(-3, 3), rf(-1, 3), cosf(t->tur) * rf(4, 12) + rf(-3, 3)}, rf(.3f, .8f), rf(.4f, 1), i % 2 ? ORANGE : (Color){90, 90, 90, 200}, 0, 1, true);
@@ -712,7 +789,15 @@ static void updateETanks(float dt) {
             t->recoil = 0;
             continue;
         }
-        float dist = distToTank(t->x, t->z);
+        int sv = cur, tp = -1; float bestD = 1e9f;   // hunt the nearest living player
+        for (int p = 0; p < MAXP; p++) {
+            if (!pactive[p] || players[p].dead) continue;
+            float dp = hypotf(players[p].x - t->x, players[p].z - t->z);
+            if (dp < bestD) { bestD = dp; tp = p; }
+        }
+        if (tp < 0) { tp = 0; for (int p = 0; p < MAXP; p++) if (pactive[p]) { tp = p; break; } }
+        cur = tp;
+        float dist = hypotf(tank.x - t->x, tank.z - t->z);
         if (dist < 110 && !tank.dead) e->alert = 20;
         e->alert = fmaxf(0, e->alert - dt);
         bool engaged = e->alert > 0 && dist < 190 && !tank.dead;
@@ -750,8 +835,11 @@ static void updateETanks(float dt) {
         if (vx * vx + vz * vz > 1e-6f) t->h += angDiff(t->h, atan2f(vx, vz)) * fminf(1, 4 * dt);
         t->odo += hypotf(vx, vz);
         // separate from the player's tank
-        float dx = tank.x - t->x, dz = tank.z - t->z, dd = hypotf(dx, dz);
-        if (dd < 5.5f && dd > 1e-3f && !tank.dead) { tank.x += dx / dd * (5.5f - dd); tank.z += dz / dd * (5.5f - dd); tank.spd *= 1 - fminf(1, 4 * dt); }
+        for (int p = 0; p < MAXP; p++) {
+            if (!pactive[p] || players[p].dead) continue;
+            float dx = players[p].x - t->x, dz = players[p].z - t->z, dd = hypotf(dx, dz);
+            if (dd < 5.5f && dd > 1e-3f) { players[p].x += dx / dd * (5.5f - dd); players[p].z += dz / dd * (5.5f - dd); players[p].spd *= 1 - fminf(1, 4 * dt); }
+        }
         // turret: track the player when engaged, otherwise look along the road
         float want = engaged ? atan2f(tank.x - t->x, tank.z - t->z) : t->h;
         float da = angDiff(t->tur, want), mx = 1.1f * dt;
@@ -761,6 +849,7 @@ static void updateETanks(float dt) {
         if (engaged && t->reload <= 0 && enemyCool <= 0 && fabsf(da) < 0.04f) fireEnemy(e);
         // squash cars in the way
         for (int c = 0; c < MAXCAR; c++) if (cars[c].alive && hypotf(cars[c].x - t->x, cars[c].z - t->z) < 2.0f + ctypes[cars[c].type].rad) { bool so = scoreOn; scoreOn = false; killCar(&cars[c], true); scoreOn = so; }
+        cur = sv;
     }
 }
 
@@ -773,17 +862,31 @@ static void damageSeg(Train *t, int k, float d) {
     float x = segX(t, k);
     g->alive = false; g->wx = x; g->wz = t->z; g->moving = false;
     int pts = g->kind == 0 ? 400 : g->kind == 2 ? 300 : 200;
-    if (scoreOn) { score += pts; addMsg("+%d %s", pts, g->kind == 0 ? "LOCOMOTIVE" : g->kind == 2 ? "TANK CAR" : "TRAIN CAR"); }
+    if (scoreOn && !isClient) { score += pts; addMsg("+%d %s", pts, g->kind == 0 ? "LOCOMOTIVE" : g->kind == 2 ? "TANK CAR" : "TRAIN CAR"); }
     debris(x, 2, t->z, 40, g->kind == 1 ? (Color){125, 70, 50, 255} : (Color){70, 70, 78, 255}, 15);
     addEmit((Vector3){x, 1.5f, t->z}, 25, 0);
     if (g->kind == 2) explode(x, 2, t->z, 22, 240, false);
     else explode(x, 2, t->z, g->kind == 0 ? 12 : 8, g->kind == 0 ? 110 : 70, false);
 }
+static void trainFx(float dt) {   // locomotive smoke and horn (the host and clients both run this)
+    for (int ti = 0; ti < 2; ti++) {
+        Train *t = &trains[ti];
+        t->hornT -= dt;
+        float lx = segX(t, 0);
+        if (t->seg[0].alive) {
+            t->seg[0].bt -= dt;
+            if (t->seg[0].bt <= 0) {
+                t->seg[0].bt = 0.12f;
+                part((Vector3){lx + t->dir * 2.5f, 4.2f, t->z}, (Vector3){rf(-.5f, .5f), rf(3, 5), rf(-.5f, .5f)}, rf(1.5f, 2.8f), rf(.7f, 1.2f), (Color){210, 210, 210, 150}, 0, 1.2f, true);
+            }
+            if (t->hornT <= 0 && distToTank(lx, t->z) < 170) { snd(sHorn, 0.7f * vol(lx, t->z), t->dir > 0 ? 1.0f : 0.9f); t->hornT = rf(7, 12); }
+        }
+    }
+}
 static void updateTrains(float dt) {
     trainHitT -= dt;
     for (int ti = 0; ti < 2; ti++) {
         Train *t = &trains[ti];
-        t->hornT -= dt;
         // the engine pulls everything behind it up to the first wreck; once the loco is dead, or a wagon is
         // destroyed, whatever is behind the break is left standing where it is
         bool ok = true;
@@ -799,15 +902,6 @@ static void updateTrains(float dt) {
         bool run = t->seg[0].moving;
         t->spd += ((run ? (ti == 0 ? 12.0f : 10.0f) : 0) - t->spd) * fminf(1, (run ? 0.8f : 1.6f) * dt);
         for (int k = 0; k < NTSEG; k++) if (t->seg[k].alive && t->seg[k].moving) t->seg[k].u += t->spd * dt;
-        float lx = segX(t, 0);
-        if (t->seg[0].alive) {
-            t->seg[0].bt -= dt;
-            if (t->seg[0].bt <= 0) {
-                t->seg[0].bt = 0.12f;
-                part((Vector3){lx + t->dir * 2.5f, 4.2f, t->z}, (Vector3){rf(-.5f, .5f), rf(3, 5), rf(-.5f, .5f)}, rf(1.5f, 2.8f), rf(.7f, 1.2f), (Color){210, 210, 210, 150}, 0, 1.2f, true);
-            }
-            if (t->hornT <= 0 && distToTank(lx, t->z) < 170) { snd(sHorn, 0.7f * vol(lx, t->z), t->dir > 0 ? 1.0f : 0.9f); t->hornT = rf(7, 12); }
-        }
         if (t->spd < 0.5f) continue;   // standing still: nothing to run over
         for (int k = 0; k < NTSEG; k++) {
             Seg *g = &t->seg[k];
@@ -918,7 +1012,7 @@ static void vehiclesCollide(float dt) {
 static bool projHit(Proj *p) {
     float x = p->p.x, y = p->p.y, z = p->p.z;
     if (p->owner == 1) {
-        if (!tank.dead && y < 3.2f && hypotf(x - tank.x, z - tank.z) < 3.4f) return true;
+        for (int p = 0; p < MAXP; p++) if (pactive[p] && !players[p].dead && y < 3.2f && hypotf(x - players[p].x, z - players[p].z) < 3.4f) return true;
     } else {
         for (int i = 0; i < MAXET; i++) {
             ETank *e = &ets[i];
@@ -1381,7 +1475,7 @@ static void drawWorld(Camera3D cam) {
     }
     for (int i = 0; i < MAXCAR; i++) { Car *c = &cars[i]; if (c->x != 0 || c->z != 0) { if (hypotf(c->x - tank.x, c->z - tank.z) < 400) drawCar(c); } }
     drawTrains();
-    drawTank(&tank, (Color){78, 92, 56, 255});
+    for (int p = 0; p < MAXP; p++) if (pactive[p]) drawTank(&players[p], pcol[p]);
     for (int i = 0; i < MAXET; i++) if (ets[i].used && hypotf(ets[i].t.x - tank.x, ets[i].t.z - tank.z) < 450) drawTank(&ets[i].t, (Color){150, 75, 60, 255});
     // shells
     for (int i = 0; i < MAXPROJ; i++) if (proj[i].on) {
@@ -1420,6 +1514,8 @@ static void drawBar(int x, int y, int w, int h, float f, Color c) {
 }
 static Camera3D gcam;
 static void drawHUD(int W, int H) {
+    int etDead = 0, etTotal = 0;   // counted from the tanks themselves, so kills by trains, blasts etc. count too
+    for (int i = 0; i < MAXET; i++) if (ets[i].used) { etTotal++; if (ets[i].t.dead) etDead++; }
     for (int i = 0; i < MAXET; i++) {
         ETank *e = &ets[i];
         if (!e->used || e->t.dead || distToTank(e->t.x, e->t.z) > 120) continue;
@@ -1430,7 +1526,7 @@ static void drawHUD(int W, int H) {
     }
     DrawText(TextFormat("SCORE %d", score), 16, 12, 32, WHITE);
     int y = 52;
-    DrawText(TextFormat("Tanks %d/5   Cars %d   Houses %d   Buildings %d   Trees %d   Fences %d", etKills, carKills, kills[O_HOUSE], kills[O_BLDG], kills[O_TREE], kills[O_FENCE]), 16, y, 18, (Color){230, 230, 230, 255});
+    DrawText(TextFormat("Tanks %d/%d   Cars %d   Houses %d   Buildings %d   Trees %d   Fences %d", etDead, etTotal, carKills, kills[O_HOUSE], kills[O_BLDG], kills[O_TREE], kills[O_FENCE]), 16, y, 18, (Color){230, 230, 230, 255});
     for (int i = 0; i < 6; i++) if (msgT[i] > 0) DrawText(msgs[i], 16, y + 28 + i * 22, 20, (Color){255, 230, 120, (unsigned char)(255 * Clamp(msgT[i], 0, 1))});
     DrawText("ARMOR", 16, H - 62, 16, WHITE); drawBar(16, H - 42, 260, 16, tank.hp / TANK_HP, tank.hp > TANK_HP * 0.3f ? (Color){80, 200, 90, 255} : (Color){230, 60, 50, 255});
     DrawText("CANNON", 300, H - 62, 16, WHITE); drawBar(300, H - 42, 160, 16, 1 - tank.reload / 1.3f, tank.reload <= 0 ? (Color){255, 200, 60, 255} : (Color){150, 120, 50, 255});
@@ -1457,11 +1553,13 @@ static void drawHUD(int W, int H) {
         DrawRectangle(ox + (int)((HALFW + ROAD / 2 - cars[i].x) * sc) - 1, oy + (int)((HALFW + ROAD / 2 - cars[i].z) * sc) - 1, 3, 3, YELLOW);
     for (int i = 0; i < MAXET; i++) if (ets[i].used && !ets[i].t.dead)
         DrawRectangle(ox + (int)((HALFW + ROAD / 2 - ets[i].t.x) * sc) - 3, oy + (int)((HALFW + ROAD / 2 - ets[i].t.z) * sc) - 3, 6, 6, (Color){255, 50, 40, 255});
-    {
-        float px = ox + (HALFW + ROAD / 2 - tank.x) * sc, py = oy + (HALFW + ROAD / 2 - tank.z) * sc;
-        float fx = -sinf(tank.h), fy = -cosf(tank.h);
+    for (int p = 0; p < MAXP; p++) {
+        if (!pactive[p] || players[p].dead) continue;
+        Tank *pt = &players[p];
+        float px = ox + (HALFW + ROAD / 2 - pt->x) * sc, py = oy + (HALFW + ROAD / 2 - pt->z) * sc;
+        float fx = -sinf(pt->h), fy = -cosf(pt->h);
         Vector2 a = {px + fx * 7, py + fy * 7}, b = {px - fx * 4 - fy * 4, py - fy * 4 + fx * 4}, c = {px - fx * 4 + fy * 4, py - fy * 4 - fx * 4};
-        DrawTriangle(a, c, b, WHITE);
+        DrawTriangle(a, c, b, p == me ? WHITE : pcol[p]);
     }
     // crosshair at the mouse
     Vector2 m = GetMousePosition();
@@ -1469,21 +1567,353 @@ static void drawHUD(int W, int H) {
     DrawLine((int)m.x - 18, (int)m.y, (int)m.x - 6, (int)m.y, WHITE); DrawLine((int)m.x + 6, (int)m.y, (int)m.x + 18, (int)m.y, WHITE);
     DrawLine((int)m.x, (int)m.y - 18, (int)m.x, (int)m.y - 6, WHITE); DrawLine((int)m.x, (int)m.y + 6, (int)m.x, (int)m.y + 18, WHITE);
     if (gameT < 12 && !tank.dead) {
-        const char *h = "W/S drive   A/D turn   Mouse aim   LMB cannon   RMB / Ctrl machine gun   Q/E look, C recenter, wheel zoom   R restart   P pause";
+        const char *h = netMode == M_SINGLE ? "W/S drive   A/D turn   Mouse aim   LMB cannon   RMB / Ctrl machine gun   Q/E look, C recenter, wheel zoom   R restart   P pause" : "W/S drive   A/D turn   Mouse aim   LMB cannon   RMB / Ctrl machine gun   Q/E look, C recenter, wheel zoom";
         DrawText(h, W / 2 - MeasureText(h, 18) / 2, H - 100, 18, (Color){255, 255, 255, (unsigned char)(255 * Clamp(12 - gameT, 0, 1))});
     }
     if (tank.dead) {
         const char *s = "TANK DESTROYED";
         DrawText(s, W / 2 - MeasureText(s, 60) / 2, H / 2 - 60, 60, (Color){255, 80, 60, 255});
-        s = TextFormat("Score %d  -  press R to restart", score);
+        bool mates = false;
+        for (int q = 0; q < MAXP; q++) if (q != me && pactive[q] && !players[q].dead) mates = true;
+        if (mates) s = isHost || netMode == M_SINGLE ? TextFormat("Respawning in %d  -  score %d", (int)ceilf(fmaxf(respawnT[me], 0)), score) : TextFormat("Respawning soon  -  score %d", score);
+        else s = isClient ? TextFormat("All tanks destroyed  -  score %d  -  waiting for the host to restart (R)", score) : TextFormat("Score %d  -  press R to restart", score);
         DrawText(s, W / 2 - MeasureText(s, 26) / 2, H / 2 + 10, 26, WHITE);
+    }
+    for (int p = 0; p < MAXP; p++) {   // teammates: name and armor above their tanks
+        if (p == me || !pactive[p] || players[p].dead) continue;
+        Vector3 wp = {players[p].x, 6.0f, players[p].z};
+        if (Vector3DotProduct(Vector3Subtract(wp, gcam.position), Vector3Subtract(gcam.target, gcam.position)) <= 0) continue;
+        Vector2 sp = GetWorldToScreen(wp, gcam);
+        const char *nm = TextFormat("P%d", p + 1);
+        DrawText(nm, (int)sp.x - MeasureText(nm, 18) / 2, (int)sp.y - 22, 18, pcol[p]);
+        drawBar((int)sp.x - 25, (int)sp.y, 50, 6, players[p].hp / TANK_HP, (Color){80, 200, 90, 255});
+    }
+    if (netMode != M_SINGLE) {
+        int n = 0; for (int p = 0; p < MAXP; p++) if (pactive[p]) n++;
+        const char *s = TextFormat(isHost ? "CO-OP  hosting on UDP port %d  -  %d player%s" : "CO-OP  you are P%d  -  %d players", isHost ? NET_PORT : me + 1, n, n == 1 ? "" : "s");
+        DrawText(s, W / 2 - MeasureText(s, 18) / 2, 32, 18, (Color){200, 230, 255, 255});
     }
     if (paused) { const char *s = "PAUSED"; DrawText(s, W / 2 - MeasureText(s, 50) / 2, H / 2 - 25, 50, WHITE); }
     if (!getenv("TT_NOFPS")) DrawFPS(W / 2 - 30, 8);
 }
 
+// ---------------------------------------------------------------- networking
+static float snapT, inputT;
+static bool gotSnap;
+static Tank ptgt[MAXP], ettgt[MAXET];                 // client: where the host says things are (we ease toward it)
+static struct { float x, z, h; } ctgt[MAXCAR];
+static char netStatus[96];
+static float mgSndT[MAXP];
+
+static unsigned worldHash(void) {   // both sides build the same city from a fixed seed; this catches version mismatches
+    unsigned h = 2166136261u;
+    h = (h ^ (unsigned)nobj) * 16777619u;
+    for (int i = 0; i < nobj; i++) {
+        h = (h ^ objs[i].type) * 16777619u;
+        h = (h ^ (unsigned)(int)(objs[i].x * 0.125f)) * 16777619u;
+        h = (h ^ (unsigned)(int)(objs[i].z * 0.125f)) * 16777619u;
+    }
+    return h;
+}
+static void wTank(Wr *w, Tank *t) {
+    wf(w, t->x); wf(w, t->z); wf(w, t->h); wf(w, t->tur); wf(w, t->pitch); wf(w, t->spd); wf(w, t->hp); wf(w, t->recoil); wf(w, t->reload);
+}
+static void rTank(Rd *r, Tank *t) {
+    t->x = rdf(r); t->z = rdf(r); t->h = rdf(r); t->tur = rdf(r); t->pitch = rdf(r); t->spd = rdf(r); t->hp = rdf(r); t->recoil = rdf(r); t->reload = rdf(r);
+}
+
+// ---- host side
+static void hostSendSnapshots(void) {
+    unsigned char buf[1400];
+    Wr w = {buf, 0, sizeof buf};
+    w8(&w, P_SNAPA);
+    w32(&w, (unsigned)score); w16(&w, etKills); w16(&w, carKills);
+    for (int i = 0; i < O_NTYPES; i++) w16(&w, kills[i]);
+    for (int p = 0; p < MAXP; p++) {
+        Tank *t = &players[p];
+        w8(&w, (pactive[p] ? 1 : 0) | (t->dead ? 2 : 0) | (t->mgOn ? 4 : 0));
+        if (pactive[p]) wTank(&w, t);
+    }
+    for (int i = 0; i < MAXET; i++) {
+        ETank *e = &ets[i];
+        w8(&w, (e->used ? 1 : 0) | (e->t.dead ? 2 : 0));
+        if (e->used) wTank(&w, &e->t);
+    }
+    for (int ti = 0; ti < 2; ti++) {
+        Train *t = &trains[ti];
+        wf(&w, t->spd);
+        for (int k = 0; k < NTSEG; k++) { w8(&w, t->seg[k].alive); wf(&w, segX(t, k)); wf(&w, segZ(t, k)); }
+    }
+    net_broadcast(0, false, buf, w.n);
+    w.n = 0; w8(&w, P_SNAPB);
+    for (int i = 0; i < MAXCAR; i++) {
+        Car *c = &cars[i];
+        w8(&w, (c->alive ? 1 : 0) | (c->crushed ? 2 : 0)); wf(&w, c->x); wf(&w, c->z); wf(&w, c->h);
+    }
+    net_broadcast(0, false, buf, w.n);
+    w.n = 0; w8(&w, P_SNAPC);
+    int cnt = 0, at = w.n; w8(&w, 0);
+    for (int i = 0; i < MAXPROJ && cnt < 48; i++) {
+        Proj *p = &proj[i];
+        if (!p->on) continue;
+        w8(&w, p->type | (p->owner << 1));
+        wf(&w, p->p.x); wf(&w, p->p.y); wf(&w, p->p.z); wf(&w, p->v.x); wf(&w, p->v.y); wf(&w, p->v.z);
+        cnt++;
+    }
+    buf[at] = (unsigned char)cnt;
+    net_broadcast(0, false, buf, w.n);
+}
+static void hostOnPacket(int slot, const unsigned char *d, int len) {
+    Rd r = {d, 0, len};
+    int type = r8(&r), p = slot + 1;
+    if (p < 1 || p >= MAXP) return;
+    if (type == P_HELLO) {
+        int ver = r8(&r); int n = r16(&r); unsigned hash = r32(&r);
+        unsigned char buf[2048];
+        Wr w = {buf, 0, sizeof buf};
+        if (ver != NET_VER || n != nobj || hash != worldHash()) {
+            w8(&w, P_REJECT); const char *m = ver != NET_VER ? "different game version" : "different world (version mismatch)";
+            for (const char *c = m; *c; c++) w8(&w, *c);
+            net_send(slot, 1, true, buf, w.n);
+            return;
+        }
+        pactive[p] = true; spawnPlayer(p); memset(&inp[p], 0, sizeof(inp[p]));
+        addMsg("Player %d joined", p + 1);
+        w8(&w, P_WELCOME); w8(&w, p);
+        for (int i = 0; i < nobj; i += 8) {
+            int bits = 0;
+            for (int b = 0; b < 8 && i + b < nobj; b++) if (!objs[i + b].alive) bits |= 1 << b;
+            w8(&w, bits);
+        }
+        net_send(slot, 1, true, buf, w.n);
+    } else if (type == P_INPUT) {
+        if (!pactive[p]) return;
+        Input *in = &inp[p];
+        in->thr = (int8_t)r8(&r) / 100.0f; in->steer = (int8_t)r8(&r) / 100.0f;
+        int b = r8(&r);
+        in->cannon = b & 1; in->mg = b & 2; in->brake = b & 4;
+        in->aim.x = rdf(&r); in->aim.z = rdf(&r); in->aim.y = 0.3f;
+    }
+}
+static void hostPoll(void) {
+    NetEvent ev;
+    while (net_poll(&ev)) {
+        if (ev.type == NET_RECEIVE) hostOnPacket(ev.peer, ev.data, ev.len);
+        else if (ev.type == NET_DISCONNECT) {
+            int p = ev.peer + 1;
+            if (p >= 1 && p < MAXP && pactive[p]) { pactive[p] = false; addMsg("Player %d left", p + 1); }
+        }
+    }
+}
+
+// ---- client side
+static void fireFx(int kind, Vector3 m, float yaw) {   // muzzle flash + bang for a shot somebody else fired
+    for (int i = 0; i < 12; i++)
+        part(m, (Vector3){sinf(yaw) * rf(4, 14) + rf(-3, 3), rf(-1, 3), cosf(yaw) * rf(4, 14) + rf(-3, 3)}, rf(.3f, .8f), rf(.4f, 1), i % 2 ? ORANGE : (Color){90, 90, 90, 200}, 0, 1, true);
+    snd(sCannon, (kind ? 0.8f : 0.9f) * vol(m.x, m.z), kind ? rf(0.85f, 0.95f) : rf(0.95f, 1.05f));
+    if (!kind) shake += 0.1f * vol(m.x, m.z);
+}
+static void clientOnEvent(Rd *r) {
+    int ev = r8(r);
+    netApplying = true;
+    switch (ev) {
+    case EV_EXPLODE: { float x = rdf(r), y = rdf(r), z = rdf(r), rad = rdf(r); bool shell = r8(r); explode(x, y, z, rad, 0, shell); break; }
+    case EV_OBJKILL: { int i = r16(r); float fx = rdf(r), fz = rdf(r); if (i >= 0 && i < nobj && objs[i].alive) killObj(&objs[i], fx, fz); break; }
+    case EV_EMIT: { Vector3 p = {rdf(r), rdf(r), rdf(r)}; float dur = rdf(r); int k = r8(r); addEmit(p, dur, k); break; }
+    case EV_MSG: { char m[64]; int n = r8(r); if (n > 60) n = 60; for (int i = 0; i < n; i++) m[i] = (char)r8(r); m[n] = 0; addMsg("%s", m); break; }
+    case EV_FIRE: { int k = r8(r); Vector3 m = {rdf(r), rdf(r), rdf(r)}; float yaw = rdf(r); fireFx(k, m, yaw); break; }
+    case EV_RESTART: genWorld(); gotSnap = false; break;
+    }
+    netApplying = false;
+}
+static void clientOnSnap(int type, Rd *r) {
+    if (type == P_SNAPA) {
+        score = (int)r32(r); etKills = r16(r); carKills = r16(r);
+        for (int i = 0; i < O_NTYPES; i++) kills[i] = r16(r);
+        for (int p = 0; p < MAXP; p++) {
+            int fl = r8(r);
+            bool was = pactive[p];
+            pactive[p] = fl & 1;
+            if (!pactive[p]) continue;
+            Tank n; memset(&n, 0, sizeof n);
+            rTank(r, &n);
+            Tank *t = &players[p];
+            bool snap = !was || !gotSnap;
+            ptgt[p] = n;
+            t->dead = fl & 2; t->mgOn = fl & 4;
+            t->hp = n.hp; t->spd = n.spd; t->recoil = n.recoil; t->reload = n.reload; t->pitch = n.pitch;
+            if (snap) { t->x = n.x; t->z = n.z; t->h = n.h; t->tur = n.tur; }
+        }
+        for (int i = 0; i < MAXET; i++) {
+            int fl = r8(r);
+            ETank *e = &ets[i];
+            e->used = fl & 1;
+            if (!e->used) continue;
+            Tank n; memset(&n, 0, sizeof n);
+            rTank(r, &n);
+            bool dead = fl & 2;
+            if (dead && !e->t.dead) debris(e->t.x, 2, e->t.z, 30, (Color){70, 80, 60, 255}, 16);
+            ettgt[i] = n;
+            e->t.dead = dead; e->t.hp = n.hp; e->t.spd = n.spd; e->t.recoil = n.recoil; e->t.pitch = n.pitch;
+            if (!gotSnap || dead) { e->t.x = n.x; e->t.z = n.z; e->t.h = n.h; e->t.tur = n.tur; }
+        }
+        for (int ti = 0; ti < 2; ti++) {
+            Train *t = &trains[ti];
+            t->spd = rdf(r);
+            for (int k = 0; k < NTSEG; k++) {
+                Seg *g = &t->seg[k];
+                bool al = r8(r); float x = rdf(r), z = rdf(r);
+                if (g->alive && !al) { g->hp = 0; damageSeg(t, k, 1); }   // visuals only on a client
+                g->alive = al; g->moving = al && t->spd > 0.5f;
+                if (al) g->u = t->dir * x + HALFW + 40; else { g->wx = x; g->wz = z; }
+            }
+        }
+        gotSnap = true;
+    } else if (type == P_SNAPB) {
+        for (int i = 0; i < MAXCAR; i++) {
+            int fl = r8(r); float x = rdf(r), z = rdf(r), h = rdf(r);
+            Car *c = &cars[i];
+            bool al = fl & 1;
+            if (c->alive && !al) { c->x = x; c->z = z; killCar(c, fl & 2); }
+            if (al) { ctgt[i].x = x; ctgt[i].z = z; ctgt[i].h = h; }
+            else { c->x = x; c->z = z; c->h = h; }
+            c->alive = al;
+        }
+    } else if (type == P_SNAPC) {
+        int cnt = r8(r);
+        memset(proj, 0, sizeof(proj));
+        for (int i = 0; i < cnt && i < MAXPROJ; i++) {
+            int tb = r8(r);
+            Proj *p = &proj[i];
+            p->on = true; p->type = tb & 1; p->owner = tb >> 1;
+            p->p = (Vector3){rdf(r), rdf(r), rdf(r)}; p->v = (Vector3){rdf(r), rdf(r), rdf(r)}; p->life = 3;
+        }
+    }
+}
+// connection state for a client: 0 connecting, 1 playing, 2 failed
+static int clientState;
+static void clientPoll(void) {
+    NetEvent ev;
+    while (net_poll(&ev)) {
+        if (ev.type == NET_CONNECT) {
+            unsigned char buf[16]; Wr w = {buf, 0, sizeof buf};
+            w8(&w, P_HELLO); w8(&w, NET_VER); w16(&w, nobj); w32(&w, worldHash());
+            net_send(0, 1, true, buf, w.n);
+        } else if (ev.type == NET_DISCONNECT) {
+            if (clientState == 0) snprintf(netStatus, sizeof netStatus, "Could not connect to the host");
+            else snprintf(netStatus, sizeof netStatus, "Lost connection to the host");
+            clientState = 2;
+        } else if (ev.type == NET_RECEIVE && ev.len > 0) {
+            Rd r = {ev.data, 0, ev.len};
+            int type = r8(&r);
+            if (type == P_WELCOME) {
+                me = r8(&r); if (me < 0 || me >= MAXP) me = 1;
+                for (int i = 0; i < nobj; i += 8) {
+                    int bits = r8(&r);
+                    for (int b = 0; b < 8 && i + b < nobj; b++) if (bits & (1 << b)) { objs[i + b].alive = false; objs[i + b].fall = 1; }
+                }
+                cur = me; pactive[me] = true; clientState = 1; gotSnap = false;
+            } else if (type == P_REJECT) {
+                snprintf(netStatus, sizeof netStatus, "Host refused: ");
+                int n = (int)strlen(netStatus);
+                while (r.n < r.len && n < (int)sizeof(netStatus) - 1) netStatus[n++] = (char)r8(&r);
+                netStatus[n] = 0; clientState = 2;
+            } else if (clientState == 1) {
+                if (type == P_EVENT) clientOnEvent(&r);
+                else clientOnSnap(type, &r);
+            }
+        }
+    }
+}
+static void clientSendInput(void) {
+    unsigned char buf[24]; Wr w = {buf, 0, sizeof buf};
+    Input *in = &inp[me];
+    w8(&w, P_INPUT); w8(&w, (int)(in->thr * 100)); w8(&w, (int)(in->steer * 100));
+    w8(&w, (in->cannon ? 1 : 0) | (in->mg ? 2 : 0) | (in->brake ? 4 : 0));
+    wf(&w, in->aim.x); wf(&w, in->aim.z);
+    net_send(0, 0, false, buf, w.n);
+}
+// client per-frame: ease toward the latest snapshot, advance shells, sounds and fx that the host doesn't send
+static void clientUpdate(float dt) {
+    float k = fminf(1, 18 * dt);
+    for (int p = 0; p < MAXP; p++) {
+        if (!pactive[p]) continue;
+        Tank *t = &players[p], *g = &ptgt[p];
+        t->x += (g->x - t->x) * k; t->z += (g->z - t->z) * k;
+        t->h += angDiff(t->h, g->h) * k; t->tur += angDiff(t->tur, g->tur) * k;
+        t->odo += t->spd * dt;
+        if (t->mgOn && !t->dead) { mgSndT[p] -= dt; if (mgSndT[p] <= 0) { mgSndT[p] = 0.075f; snd(sMG, 0.25f * vol(t->x, t->z), rf(0.9f, 1.3f)); } }
+        if (fabsf(t->spd) > 3 && !t->dead && GetRandomValue(0, 3) == 0)
+            part((Vector3){t->x - sinf(t->h) * 3.4f * (t->spd > 0 ? 1 : -1) + rf(-1.5f, 1.5f), 0.3f, t->z - cosf(t->h) * 3.4f * (t->spd > 0 ? 1 : -1)}, (Vector3){rf(-.5f, .5f), rf(.5f, 1.5f), rf(-.5f, .5f)}, rf(.6f, 1.2f), rf(.6f, 1.2f), (Color){170, 160, 140, 110}, 0, 1.5f, true);
+    }
+    for (int i = 0; i < MAXET; i++) {
+        ETank *e = &ets[i];
+        if (!e->used || e->t.dead) continue;
+        e->t.x += (ettgt[i].x - e->t.x) * k; e->t.z += (ettgt[i].z - e->t.z) * k;
+        e->t.h += angDiff(e->t.h, ettgt[i].h) * k; e->t.tur += angDiff(e->t.tur, ettgt[i].tur) * k;
+        e->t.odo += fabsf(e->t.spd) * dt;
+    }
+    for (int i = 0; i < MAXCAR; i++) {
+        Car *c = &cars[i];
+        if (!c->alive) { if (c->x != 0 || c->z != 0) deadCarFx(c, dt); continue; }
+        c->x += (ctgt[i].x - c->x) * k; c->z += (ctgt[i].z - c->z) * k;
+        c->h += angDiff(c->h, ctgt[i].h) * k;
+    }
+    for (int i = 0; i < MAXPROJ; i++) {
+        Proj *p = &proj[i];
+        if (!p->on) continue;
+        if (p->type == 0) p->v.y -= GRAV * dt;
+        p->p = Vector3Add(p->p, Vector3Scale(p->v, dt));
+        if (p->type == 0 && GetRandomValue(0, 1) == 0) part(p->p, (Vector3){0, 0.5f, 0}, 0.5f, 0.5f, (Color){200, 200, 200, 150}, 0, 0.8f, true);
+    }
+}
+
+// ---- menu / startup
+static bool startHost(int port) {
+    if (!net_host(port, MAXP - 1)) return false;
+    netMode = M_HOST; pactive[0] = true; me = 0; cur = 0;
+    return true;
+}
+static bool startJoin(const char *addr) {
+    char host[96]; int port = NET_PORT;
+    snprintf(host, sizeof host, "%s", addr);
+    char *colon = strrchr(host, ':');
+    if (colon) { *colon = 0; port = atoi(colon + 1); if (port <= 0) port = NET_PORT; }
+    if (host[0] == 0) snprintf(host, sizeof host, "127.0.0.1");
+    if (!net_connect(host, port)) return false;
+    netMode = M_CLIENT; clientState = 0; snprintf(netStatus, sizeof netStatus, "Connecting to %.60s:%d ...", host, port);
+    return true;
+}
+
 // ---------------------------------------------------------------- main
-int main(void) {
+enum { PH_MENU, PH_IP, PH_CONNECT, PH_PLAY };
+static void drawMenu(int phase, const char *ip, const char *msg) {
+    int W = GetScreenWidth(), H = GetScreenHeight();
+    ClearBackground((Color){24, 30, 22, 255});
+    const char *t = "TANK TRACKS";
+    DrawText(t, W / 2 - MeasureText(t, 90) / 2, H / 5, 90, (Color){190, 210, 120, 255});
+    int y = H / 2 - 20;
+    if (phase == PH_MENU) {
+        const char *l[3] = {"1   Single player", "2   Host a co-op game (up to 4 players)", "3   Join a co-op game"};
+        for (int i = 0; i < 3; i++) DrawText(l[i], W / 2 - 280, y + i * 44, 30, WHITE);
+        DrawText("Esc quits", W / 2 - 280, y + 160, 20, GRAY);
+    } else if (phase == PH_IP) {
+        DrawText("Host address (IP or name, optional :port - default port 7777)", W / 2 - 330, y - 10, 22, WHITE);
+        DrawRectangle(W / 2 - 330, y + 30, 660, 44, (Color){0, 0, 0, 160});
+        DrawText(TextFormat("%s%s", ip, ((int)(GetTime() * 2) & 1) ? "_" : ""), W / 2 - 320, y + 38, 30, (Color){255, 230, 120, 255});
+        DrawText("Enter to connect, Esc to go back (empty = this computer)", W / 2 - 330, y + 90, 20, GRAY);
+    } else if (phase == PH_CONNECT) {
+        DrawText(msg, W / 2 - MeasureText(msg, 28) / 2, y + 10, 28, WHITE);
+        DrawText("Esc to cancel", W / 2 - 60, y + 60, 20, GRAY);
+    }
+    if (msg && phase != PH_CONNECT && msg[0]) DrawText(msg, W / 2 - MeasureText(msg, 24) / 2, H - 80, 24, (Color){255, 120, 100, 255});
+}
+static bool anyOtherAlive(int p) {
+    for (int q = 0; q < MAXP; q++) if (q != p && pactive[q] && !players[q].dead) return true;
+    return false;
+}
+
+int main(int argc, char **argv) {
     SetConfigFlags(FLAG_MSAA_4X_HINT | FLAG_VSYNC_HINT | FLAG_WINDOW_RESIZABLE);
     InitWindow(1280, 720, "TANK TRACKS");
     SetExitKey(KEY_NULL);
@@ -1500,15 +1930,27 @@ int main(void) {
     }
     rlDisableBackfaceCulling();
     rlSetClipPlanes(1.0, 3500.0);
-    HideCursor();
     makeAds();
-    genWorld();
+    pactive[0] = true;
+    genWorld();   // every machine builds the same city from a fixed seed
+    const char *shotPath = getenv("TT_SHOT");     // test hooks: TT_SHOT=file.png TT_DEMO=1 ...
+    bool demo = getenv("TT_DEMO") != NULL;
+    int phase = PH_MENU;
+    char ip[96] = "";
+    char menuMsg[128] = "";
+    // command line: --host [port]   --join host[:port]
+    for (int i = 1; i < argc; i++) {
+        if (!strcmp(argv[i], "--host")) { if (startHost(i + 1 < argc && atoi(argv[i + 1]) > 0 ? atoi(argv[i + 1]) : NET_PORT)) phase = PH_PLAY; else snprintf(menuMsg, sizeof menuMsg, "Could not start the host"); }
+        else if (!strcmp(argv[i], "--join") && i + 1 < argc) { if (startJoin(argv[i + 1])) phase = PH_CONNECT; else snprintf(menuMsg, sizeof menuMsg, "Could not connect"); }
+    }
+    if ((shotPath || demo) && netMode == M_SINGLE) phase = PH_PLAY;
+    if (phase == PH_PLAY) HideCursor();
     if (getenv("TT_TYPE")) {   // test hook: park the tank 40 units south of the first object of this type
         int ty = atoi(getenv("TT_TYPE"));
         for (int i = 0; i < nobj; i++) if (objs[i].type == ty) { if (objs[i].face & 1) { tank.x = objs[i].x + 40; tank.z = objs[i].z; tank.h = -PI / 2; } else { tank.x = objs[i].x; tank.z = objs[i].z - 40; tank.h = 0; } camYaw = tank.h; fprintf(stderr, "found at %.0f %.0f\n", objs[i].x, objs[i].z); break; }
     }
     if (getenv("TT_TRAIN")) { for (int k = 0; k < NTSEG; k++) trains[0].seg[k].u = HALFW + 40 - 20 - k * TLEN; tank.x = -35; tank.z = trains[0].z - 40; tank.h = 0; camYaw = 0; }
-    if (getenv("TT_BUS")) {   // test hook: a bus (1 = wreck, 2 = alive) parked 9 units ahead of the tank
+    if (getenv("TT_BUS")) {
         cars[0].x = tank.x; cars[0].z = tank.z + 9; cars[0].h = PI / 2 + 0.3f; cars[0].d = 1;
         if (atoi(getenv("TT_BUS")) == 1) { bool so = scoreOn; scoreOn = false; killCar(&cars[0], false); scoreOn = so; cars[0].fireT = 0; cars[0].boomT = 0; }
     }
@@ -1516,15 +1958,44 @@ int main(void) {
     Camera3D cam = {0};
     cam.up = (Vector3){0, 1, 0}; cam.fovy = 60; cam.projection = CAMERA_PERSPECTIVE;
     int frame = 0;
-    const char *shotPath = getenv("TT_SHOT");     // test hook: TT_SHOT=file.png TT_DEMO=1
-    bool demo = getenv("TT_DEMO") != NULL;
     SetTargetFPS(60);
     while (!WindowShouldClose()) {
         float dt = fminf(GetFrameTime(), 0.05f);
         int W = GetScreenWidth(), H = GetScreenHeight();
+        if (phase != PH_PLAY) {   // ---- title / join screens
+            if (phase == PH_MENU) {
+                if (IsKeyPressed(KEY_ESCAPE)) break;
+                if (IsKeyPressed(KEY_ONE) || IsKeyPressed(KEY_KP_1)) { phase = PH_PLAY; HideCursor(); }
+                if (IsKeyPressed(KEY_TWO) || IsKeyPressed(KEY_KP_2)) {
+                    if (startHost(NET_PORT)) { phase = PH_PLAY; HideCursor(); } else snprintf(menuMsg, sizeof menuMsg, "Could not start the host (is port %d in use?)", NET_PORT);
+                }
+                if (IsKeyPressed(KEY_THREE) || IsKeyPressed(KEY_KP_3)) { phase = PH_IP; menuMsg[0] = 0; }
+            } else if (phase == PH_IP) {
+                int ch;
+                while ((ch = GetCharPressed()) > 0) { int n = (int)strlen(ip); if (n < 90 && ch > 32 && ch < 127) { ip[n] = (char)ch; ip[n + 1] = 0; } }
+                if (IsKeyPressed(KEY_BACKSPACE) && ip[0]) ip[strlen(ip) - 1] = 0;
+                if (IsKeyPressed(KEY_ESCAPE)) { phase = PH_MENU; menuMsg[0] = 0; }
+                if (IsKeyPressed(KEY_ENTER) || IsKeyPressed(KEY_KP_ENTER)) {
+                    if (startJoin(ip)) phase = PH_CONNECT; else snprintf(menuMsg, sizeof menuMsg, "Could not resolve that address");
+                }
+            } else if (phase == PH_CONNECT) {
+                if (IsKeyPressed(KEY_ESCAPE)) { net_stop(); netMode = M_SINGLE; phase = PH_MENU; menuMsg[0] = 0; }
+                clientPoll();
+                if (clientState == 1) { phase = PH_PLAY; HideCursor(); }
+                else if (clientState == 2) { net_stop(); netMode = M_SINGLE; phase = PH_MENU; snprintf(menuMsg, sizeof menuMsg, "%.95s", netStatus); }
+            }
+            BeginDrawing();
+            drawMenu(phase, ip, phase == PH_CONNECT ? netStatus : menuMsg);
+            EndDrawing();
+            continue;
+        }
+        cur = me;
+        bool netGame = netMode != M_SINGLE;
         if (IsKeyPressed(KEY_ESCAPE)) break;
-        if (IsKeyPressed(KEY_P)) paused = !paused;
-        if (IsKeyPressed(KEY_R)) genWorld();
+        if (IsKeyPressed(KEY_P) && !netGame) paused = !paused;
+        if (IsKeyPressed(KEY_R) && !isClient) { genWorld(); if (isHost) evRestart(); }
+        if (isHost) hostPoll();
+        if (isClient) { clientPoll(); if (clientState == 2) { net_stop(); netMode = M_SINGLE; phase = PH_MENU; ShowCursor(); snprintf(menuMsg, sizeof menuMsg, "%.95s", netStatus); genWorld(); memset(pactive, 0, sizeof pactive); pactive[0] = true; me = 0; cur = 0; continue; } }
         {   // Q/E look around while held; the camera swings back behind the tank when released (C snaps it back)
             float qe = (IsKeyDown(KEY_E) ? 1 : 0) - (IsKeyDown(KEY_Q) ? 1 : 0);
             if (qe != 0) camOff += qe * 1.8f * dt;
@@ -1539,6 +2010,13 @@ int main(void) {
         cam.position = (Vector3){tp.x - sinf(camYaw) * camDist, ch, tp.z - cosf(camYaw) * camDist};
         cam.target = (Vector3){tp.x + sinf(camYaw) * 6, 1.5f, tp.z + cosf(camYaw) * 6};
         if (shake > 0) { cam.position.x += rf(-1, 1) * shake; cam.position.y += rf(-1, 1) * shake; shake = fmaxf(0, shake - 2.5f * dt); }
+        // controls -> this player's input
+        Input *in = &inp[me];
+        in->thr = (IsKeyDown(KEY_W) || IsKeyDown(KEY_UP) ? 1 : 0) - (IsKeyDown(KEY_S) || IsKeyDown(KEY_DOWN) ? 1 : 0);
+        in->steer = (IsKeyDown(KEY_A) || IsKeyDown(KEY_LEFT) ? 1 : 0) - (IsKeyDown(KEY_D) || IsKeyDown(KEY_RIGHT) ? 1 : 0);
+        in->brake = IsKeyDown(KEY_SPACE);
+        in->cannon = IsMouseButtonDown(MOUSE_BUTTON_LEFT);
+        in->mg = IsMouseButtonDown(MOUSE_BUTTON_RIGHT) || IsKeyDown(KEY_LEFT_CONTROL);
         // mouse -> ground point
         Ray ray = GetScreenToWorldRay(GetMousePosition(), cam);
         if (ray.direction.y < -0.02f) {
@@ -1551,16 +2029,37 @@ int main(void) {
         if (demo) {   // scripted run for screenshots: drive forward and shell whatever is ahead
             aimPt = (Vector3){tank.x + sinf(tank.h + (getenv("TT_TRAIN") ? 0.0f : 0.35f)) * 45, 0.3f, tank.z + cosf(tank.h + (getenv("TT_TRAIN") ? 0.0f : 0.35f)) * 45};
         }
-        if (!paused) {
+        if (getenv("TT_AUTO")) {   // test hook: drive forward and fire the cannon every other second
+            in->thr = 1; in->steer = atoi(getenv("TT_AUTO")) > 1 ? 0.3f : 0; in->cannon = (frame / 60) % 2;
+            aimPt = (Vector3){tank.x + sinf(tank.tur) * 45, 0.3f, tank.z + cosf(tank.tur) * 45};
+        }
+        if (isClient) {
+            inputT += dt;
+            if (inputT >= 1.0f / 30) { inputT = 0; clientSendInput(); }
+            clientUpdate(dt);
+            trainFx(dt);
+            updateFx(dt);
+        } else if (!paused) {
             gameT += dt;
             if (getenv("TT_KILLLOCO") && frame == 30) damageSeg(&trains[0], 0, 1e4f);
             if (demo) { if (frame % 90 == 5 && tank.reload <= 0) fireShell(); tank.spd = 8; }
-            updateTank(dt);
+            for (int p = 0; p < MAXP; p++) if (pactive[p]) { cur = p; updateTank(dt); }
+            cur = me;
             updateCars(dt);
             updateETanks(dt);
             updateTrains(dt);
+            trainFx(dt);
             updateProj(dt);
             updateFx(dt);
+            for (int p = 0; p < MAXP; p++) {   // a dead tank comes back after a few seconds as long as a teammate is still alive
+                if (!pactive[p] || !players[p].dead) continue;
+                respawnT[p] -= dt;
+                if (respawnT[p] <= 0 && anyOtherAlive(p)) { spawnPlayer(p); addMsg("Player %d is back in action", p + 1); }
+            }
+            if (isHost) {
+                snapT += dt;
+                if (snapT >= 1.0f / 30) { snapT = 0; hostSendSnapshots(); }
+            }
         }
         if (audioOK) {
             if (!IsSoundPlaying(sEng) && !tank.dead) PlaySound(sEng);
@@ -1573,9 +2072,11 @@ int main(void) {
         drawWorld(cam);
         drawHUD(W, H);
         EndDrawing();
+        net_flush();
         frame++;
-        if (shotPath && frame == 240) { TakeScreenshot(shotPath); break; }
+        if (shotPath && frame == (getenv("TT_FRAMES") ? atoi(getenv("TT_FRAMES")) : 240)) { TakeScreenshot(shotPath); break; }
     }
+    net_stop();
     CloseAudioDevice();
     CloseWindow();
     return 0;
