@@ -13,4 +13,15 @@ void net_send(int peer, int channel, bool reliable, const void *data, int len);
 void net_broadcast(int channel, bool reliable, const void *data, int len);
 void net_flush(void);
 bool net_active(void);
+
+// ---- LAN discovery (plain UDP broadcast on its own socket, independent of the ENet game port)
+#define NET_DISCO_PORT 7778
+typedef struct { char ip[48]; int port, players, maxPlayers; } NetLanGame;
+// host side: answer probes; call net_lan_serve_update every frame (players = current count)
+bool net_lan_serve(int gamePort, int maxPlayers);
+void net_lan_serve_update(int players);
+// client side: net_lan_scan_update probes about once a second and returns the live list (games unseen for ~4s drop out)
+bool net_lan_scan_start(void);
+int  net_lan_scan_update(NetLanGame *out, int max);
+void net_lan_scan_stop(void);
 #endif

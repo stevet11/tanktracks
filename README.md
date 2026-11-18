@@ -54,7 +54,7 @@ hold at ~70 units and lead their shots. They die to ~3 cannon hits (500 points e
 hurt you much more than your own splash does. Red dots on the minimap, health bars over their turrets.
 
 ## Co-op (2-4 players)
-One player hosts, the others join. Pick it on the title screen (2 = host, 3 = join and type the host's address),
+One player hosts, the others join. Pick it on the title screen (2 = host, 3 = join: games on your local network are listed automatically, or type the host's address),
 or from the command line:
 ```
 ./tanktracks --host            # listens on UDP port 7777 (use --host 9000 for another port)
@@ -63,7 +63,7 @@ or from the command line:
 Everybody fights the same enemy tanks, traffic and trains and shares one score. A destroyed tank respawns
 after a few seconds as long as a teammate is still alive; if everybody is down the host presses R to restart.
 Your shells splash teammates a little. For play over the internet the host has to forward UDP port 7777
-on their router (or use a VPN such as ZeroTier/Tailscale and join the VPN address).
+on their router (LAN discovery is a UDP broadcast on port 7778 and only finds games on the same subnet) (or use a VPN such as ZeroTier/Tailscale and join the VPN address).
 
 How it works: the host runs the whole simulation; clients send their controls (30 times a second) and draw the
 snapshots the host sends back. The city is generated from a fixed seed on every machine, so only the things that

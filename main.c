@@ -1878,6 +1878,7 @@ static void clientUpdate(float dt) {
 // ---- menu / startup
 static bool startHost(int port) {
     if (!net_host(port, MAXP - 1)) return false;
+    net_lan_serve(port, MAXP);
     netMode = M_HOST; pactive[0] = true; me = 0; cur = 0;
     return true;
 }
@@ -1894,6 +1895,7 @@ static bool startJoin(const char *addr) {
 
 // ---------------------------------------------------------------- main
 enum { PH_MENU, PH_IP, PH_CONNECT, PH_PLAY };
+static NetLanGame lan[16]; static int nlan, lanSel;
 static void drawMenu(int phase, const char *ip, const char *msg) {
     int W = GetScreenWidth(), H = GetScreenHeight();
     ClearBackground((Color){24, 30, 22, 255});
@@ -1908,7 +1910,12 @@ static void drawMenu(int phase, const char *ip, const char *msg) {
         DrawText("Host address (IP or name, optional :port - default port 7777)", W / 2 - 330, y - 10, 22, WHITE);
         DrawRectangle(W / 2 - 330, y + 30, 660, 44, (Color){0, 0, 0, 160});
         DrawText(TextFormat("%s%s", ip, ((int)(GetTime() * 2) & 1) ? "_" : ""), W / 2 - 320, y + 38, 30, (Color){255, 230, 120, 255});
-        DrawText("Enter to connect, Esc to go back (empty = this computer)", W / 2 - 330, y + 90, 20, GRAY);
+        DrawText(nlan ? "Enter to connect, Up/Down picks a LAN game (leave the box empty), Esc goes back" : "Enter to connect, Esc to go back (empty = this computer)", W / 2 - 330, y + 90, 20, GRAY);
+        DrawText(nlan ? "Games found on your network:" : "Searching the network for games ...", W / 2 - 330, y + 130, 22, (Color){190, 210, 120, 255});
+        for (int i = 0; i < nlan; i++) {
+            bool sel = i == lanSel && !ip[0];
+            DrawText(TextFormat("%s %s:%d   %d/%d players", sel ? ">" : " ", lan[i].ip, lan[i].port, lan[i].players, lan[i].maxPlayers), W / 2 - 330, y + 165 + i * 30, 26, sel ? (Color){255, 230, 120, 255} : WHITE);
+        }
     } else if (phase == PH_CONNECT) {
         DrawText(msg, W / 2 - MeasureText(msg, 28) / 2, y + 10, 28, WHITE);
         DrawText("Esc to cancel", W / 2 - 60, y + 60, 20, GRAY);
@@ -1976,14 +1983,21 @@ int main(int argc, char **argv) {
                 if (IsKeyPressed(KEY_TWO) || IsKeyPressed(KEY_KP_2)) {
                     if (startHost(NET_PORT)) { phase = PH_PLAY; HideCursor(); } else snprintf(menuMsg, sizeof menuMsg, "Could not start the host (is port %d in use?)", NET_PORT);
                 }
-                if (IsKeyPressed(KEY_THREE) || IsKeyPressed(KEY_KP_3)) { phase = PH_IP; menuMsg[0] = 0; }
+                if (IsKeyPressed(KEY_THREE) || IsKeyPressed(KEY_KP_3)) { phase = PH_IP; menuMsg[0] = 0; nlan = 0; lanSel = 0; net_lan_scan_start(); }
             } else if (phase == PH_IP) {
+                nlan = net_lan_scan_update(lan, 8);
+                if (lanSel >= nlan) lanSel = nlan ? nlan - 1 : 0;
+                if (IsKeyPressed(KEY_DOWN) && lanSel < nlan - 1) lanSel++;
+                if (IsKeyPressed(KEY_UP) && lanSel > 0) lanSel--;
                 int ch;
                 while ((ch = GetCharPressed()) > 0) { int n = (int)strlen(ip); if (n < 90 && ch > 32 && ch < 127) { ip[n] = (char)ch; ip[n + 1] = 0; } }
                 if (IsKeyPressed(KEY_BACKSPACE) && ip[0]) ip[strlen(ip) - 1] = 0;
-                if (IsKeyPressed(KEY_ESCAPE)) { phase = PH_MENU; menuMsg[0] = 0; }
+                if (IsKeyPressed(KEY_ESCAPE)) { net_lan_scan_stop(); phase = PH_MENU; menuMsg[0] = 0; }
                 if (IsKeyPressed(KEY_ENTER) || IsKeyPressed(KEY_KP_ENTER)) {
-                    if (startJoin(ip)) phase = PH_CONNECT; else snprintf(menuMsg, sizeof menuMsg, "Could not resolve that address");
+                    char target[96]; snprintf(target, sizeof target, "%s", ip);
+                    if (!ip[0] && nlan) snprintf(target, sizeof target, "%s:%d", lan[lanSel].ip, lan[lanSel].port);
+                    net_lan_scan_stop();
+                    if (startJoin(target)) phase = PH_CONNECT; else snprintf(menuMsg, sizeof menuMsg, "Could not resolve that address");
                 }
             } else if (phase == PH_CONNECT) {
                 if (IsKeyPressed(KEY_ESCAPE)) { net_stop(); netMode = M_SINGLE; phase = PH_MENU; menuMsg[0] = 0; }
@@ -2002,7 +2016,7 @@ int main(int argc, char **argv) {
         if (IsKeyPressed(KEY_ESCAPE)) break;
         if (IsKeyPressed(KEY_P) && !netGame) paused = !paused;
         if (IsKeyPressed(KEY_R) && !isClient) { genWorld(); if (isHost) evRestart(); }
-        if (isHost) hostPoll();
+        if (isHost) { hostPoll(); int np = 0; for (int p = 0; p < MAXP; p++) if (pactive[p]) np++; net_lan_serve_update(np); }
         if (isClient) { clientPoll(); if (clientState == 2) { net_stop(); netMode = M_SINGLE; phase = PH_MENU; ShowCursor(); snprintf(menuMsg, sizeof menuMsg, "%.95s", netStatus); genWorld(); memset(pactive, 0, sizeof pactive); pactive[0] = true; me = 0; cur = 0; continue; } }
         {   // Q/E look around while held; the camera swings back behind the tank when released (C snaps it back)
             float qe = (IsKeyDown(KEY_E) ? 1 : 0) - (IsKeyDown(KEY_Q) ? 1 : 0);
