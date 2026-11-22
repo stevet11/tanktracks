@@ -30,6 +30,14 @@ or `cmake -S . -B build -DCMAKE_BUILD_TYPE=Release && cmake --build build`. rayl
 W/S drive, A/D turn, mouse aims the turret (the cannon shell lands on the red ring),
 LMB cannon, RMB or Ctrl machine gun, Q/E look around (it swings back when released), C recenters, mouse wheel zooms, R restart, P pause, Esc quit.
 
+Gamepad (Xbox 360 / Xbox-style layout): left stick drives, right stick moves the crosshair (gently for fine
+aim, push all the way to sweep; it stays where you leave it, and moving the mouse takes over again), RT cannon,
+LT machine gun, A brake, LB/RB look around, right-stick click recenters, D-pad up/down zooms, Back restart,
+Start pause. On the menus A = single player, X = host, Y = join, D-pad picks a LAN game, A connects, B goes back.
+Other pads: on Linux any pad on the kernel `xpad` driver is mapped automatically; anything else can be added
+with an SDL-style mapping line in `SDL_GAMECONTROLLERCONFIG`. `TT_PADLOG=1 ./tanktracks` prints the live stick
+and button state to the terminal for testing.
+
 ## Targets
 Houses, skyscrapers (downtown), trees, fences and lamp posts (crushed by driving over them), water towers (they burst), billboards, fuel tanks and
 gas pumps (chain explosions), fire hydrants (geysers), mailboxes, and the ironroad cars (Brawler, Hornet,

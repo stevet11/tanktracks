@@ -9,6 +9,9 @@
 #include <string.h>
 #include <stdint.h>
 #include "net.h"
+#ifdef __linux__
+#include <unistd.h>
+#endif
 
 // ---------------------------------------------------------------- world constants
 #define N 9                    // blocks per side
@@ -120,6 +123,51 @@ static char msgs[6][64];
 static float msgT[6];
 static float shake, gameT;
 static float camYaw, camOff, camDist = 26;
+// ---------------------------------------------------------------- gamepad (Xbox-style layout via raylib's mapping db)
+static int padId = -1;          // first connected gamepad, or -1
+static bool padAim;             // the right stick owns the crosshair until the mouse moves again
+static Vector2 padCur;          // the stick-driven crosshair, in screen pixels
+// GLFW only treats a joystick as a gamepad when its GUID (bus/vendor/product/VERSION) is in its mapping table, and
+// many Xbox pads report a version that isn't. On Linux every pad on the kernel xpad driver has the same layout, so
+// register that layout for the exact GUID of each one plugged in. SDL_GAMECONTROLLERCONFIG can add more mappings.
+static void addPadMappings(void) {
+    if (getenv("SDL_GAMECONTROLLERCONFIG")) SetGamepadMappings(getenv("SDL_GAMECONTROLLERCONFIG"));
+#ifdef __linux__
+    for (int js = 0; js < 16; js++) {
+        char p[128], drv[256]; unsigned v[4]; const char *f[4] = {"bustype", "vendor", "product", "version"};
+        snprintf(p, sizeof p, "/sys/class/input/js%d/device/device/driver", js);
+        ssize_t n = readlink(p, drv, sizeof drv - 1);
+        if (n <= 0) continue;
+        drv[n] = 0;
+        const char *base = strrchr(drv, '/');
+        if (strcmp(base ? base + 1 : drv, "xpad")) continue;
+        bool ok = true;
+        for (int k = 0; k < 4 && ok; k++) {
+            snprintf(p, sizeof p, "/sys/class/input/js%d/device/id/%s", js, f[k]);
+            FILE *fp = fopen(p, "r");
+            ok = fp && fscanf(fp, "%x", &v[k]) == 1;
+            if (fp) fclose(fp);
+        }
+        if (!ok) continue;
+        char guid[33];   // GLFW's Linux GUID: each id as little-endian 16 bits followed by 16 zero bits
+        snprintf(guid, sizeof guid, "%02x%02x0000%02x%02x0000%02x%02x0000%02x%02x0000",
+                 v[0] & 255, (v[0] >> 8) & 255, v[1] & 255, (v[1] >> 8) & 255, v[2] & 255, (v[2] >> 8) & 255, v[3] & 255, (v[3] >> 8) & 255);
+        SetGamepadMappings(TextFormat("%s,Xbox pad (xpad),a:b0,b:b1,back:b6,dpdown:h0.4,dpleft:h0.8,dpright:h0.2,dpup:h0.1,guide:b8,"
+                                      "leftshoulder:b4,leftstick:b9,lefttrigger:a2,leftx:a0,lefty:a1,rightshoulder:b5,rightstick:b10,"
+                                      "righttrigger:a5,rightx:a3,righty:a4,start:b7,x:b2,y:b3,platform:Linux,", guid));
+    }
+#endif
+}
+static void pickPad(void) { padId = -1; for (int i = 0; i < 4; i++) if (IsGamepadAvailable(i)) { padId = i; break; } }
+static bool padDown(int b) { return padId >= 0 && IsGamepadButtonDown(padId, b); }
+static bool padHit(int b) { return padId >= 0 && IsGamepadButtonPressed(padId, b); }
+static float padAxis(int a) {   // stick axis with a dead zone, rescaled to -1..1
+    if (padId < 0) return 0;
+    float v = GetGamepadAxisMovement(padId, a);
+    return fabsf(v) < 0.2f ? 0 : (v - copysignf(0.2f, v)) / 0.8f;
+}
+static bool padTrig(int axis, int btn) { return padId >= 0 && (GetGamepadAxisMovement(padId, axis) > 0.3f || IsGamepadButtonDown(padId, btn)); }
+
 static bool paused, audioOK;
 static unsigned char blockKind[N][N];
 static Sound sHorn, sCannon, sMG, sExp, sCrunch, sEng, sPick;
@@ -1569,12 +1617,13 @@ static void drawHUD(int W, int H) {
         DrawTriangle(a, c, b, p == me ? WHITE : pcol[p]);
     }
     // crosshair at the mouse
-    Vector2 m = getenv("TT_NOFPS") ? GetWorldToScreen(inp[me].aim, gcam) : GetMousePosition();   // screenshot runs have no mouse
+    Vector2 m = padAim ? padCur : getenv("TT_NOFPS") ? GetWorldToScreen(inp[me].aim, gcam) : GetMousePosition();   // screenshot runs have no mouse
     DrawCircleLines((int)m.x, (int)m.y, 12, (Color){255, 255, 255, 220});
     DrawLine((int)m.x - 18, (int)m.y, (int)m.x - 6, (int)m.y, WHITE); DrawLine((int)m.x + 6, (int)m.y, (int)m.x + 18, (int)m.y, WHITE);
     DrawLine((int)m.x, (int)m.y - 18, (int)m.x, (int)m.y - 6, WHITE); DrawLine((int)m.x, (int)m.y + 6, (int)m.x, (int)m.y + 18, WHITE);
     if (gameT < 12 && !tank.dead && !getenv("TT_NOFPS")) {
         const char *h = netMode == M_SINGLE ? "W/S drive   A/D turn   Mouse aim   LMB cannon   RMB / Ctrl machine gun   Q/E look, C recenter, wheel zoom   R restart   P pause" : "W/S drive   A/D turn   Mouse aim   LMB cannon   RMB / Ctrl machine gun   Q/E look, C recenter, wheel zoom";
+        if (padId >= 0) h = netMode == M_SINGLE ? "Left stick drive   Right stick aim   RT cannon   LT machine gun   A brake   LB/RB look, R-click recenter, D-pad zoom   Back restart   Start pause" : "Left stick drive   Right stick aim   RT cannon   LT machine gun   A brake   LB/RB look, R-click recenter, D-pad zoom   Back restart";
         DrawText(h, W / 2 - MeasureText(h, 18) / 2, H - 100, 18, (Color){255, 255, 255, (unsigned char)(255 * Clamp(12 - gameT, 0, 1))});
     }
     if (tank.dead) {
@@ -1903,14 +1952,14 @@ static void drawMenu(int phase, const char *ip, const char *msg) {
     DrawText(t, W / 2 - MeasureText(t, 90) / 2, H / 5, 90, (Color){190, 210, 120, 255});
     int y = H / 2 - 20;
     if (phase == PH_MENU) {
-        const char *l[3] = {"1   Single player", "2   Host a co-op game (up to 4 players)", "3   Join a co-op game"};
+        const char *l[3] = {"1 / A   Single player", "2 / X   Host a co-op game (up to 4 players)", "3 / Y   Join a co-op game"};
         for (int i = 0; i < 3; i++) DrawText(l[i], W / 2 - 280, y + i * 44, 30, WHITE);
-        DrawText("Esc quits", W / 2 - 280, y + 160, 20, GRAY);
+        DrawText(padId >= 0 ? TextFormat("Esc quits   -   controller: %s", GetGamepadName(padId)) : "Esc quits", W / 2 - 280, y + 160, 20, GRAY);
     } else if (phase == PH_IP) {
         DrawText("Host address (IP or name, optional :port - default port 7777)", W / 2 - 330, y - 10, 22, WHITE);
         DrawRectangle(W / 2 - 330, y + 30, 660, 44, (Color){0, 0, 0, 160});
         DrawText(TextFormat("%s%s", ip, ((int)(GetTime() * 2) & 1) ? "_" : ""), W / 2 - 320, y + 38, 30, (Color){255, 230, 120, 255});
-        DrawText(nlan ? "Enter to connect, Up/Down picks a LAN game (leave the box empty), Esc goes back" : "Enter to connect, Esc to go back (empty = this computer)", W / 2 - 330, y + 90, 20, GRAY);
+        DrawText(nlan ? "Enter / A to connect, Up/Down picks a LAN game (leave the box empty), Esc / B goes back" : "Enter / A to connect, Esc / B to go back (empty = this computer)", W / 2 - 330, y + 90, 20, GRAY);
         DrawText(nlan ? "Games found on your network:" : "Searching the network for games ...", W / 2 - 330, y + 130, 22, (Color){190, 210, 120, 255});
         for (int i = 0; i < nlan; i++) {
             bool sel = i == lanSel && !ip[0];
@@ -1918,7 +1967,7 @@ static void drawMenu(int phase, const char *ip, const char *msg) {
         }
     } else if (phase == PH_CONNECT) {
         DrawText(msg, W / 2 - MeasureText(msg, 28) / 2, y + 10, 28, WHITE);
-        DrawText("Esc to cancel", W / 2 - 60, y + 60, 20, GRAY);
+        DrawText("Esc / B to cancel", W / 2 - 80, y + 60, 20, GRAY);
     }
     if (msg && phase != PH_CONNECT && msg[0]) DrawText(msg, W / 2 - MeasureText(msg, 24) / 2, H - 80, 24, (Color){255, 120, 100, 255});
 }
@@ -1931,6 +1980,7 @@ int main(int argc, char **argv) {
     SetConfigFlags(FLAG_MSAA_4X_HINT | FLAG_VSYNC_HINT | FLAG_WINDOW_RESIZABLE);
     InitWindow(1280, 720, "TANK TRACKS");
     SetExitKey(KEY_NULL);
+    addPadMappings();
     InitAudioDevice();
     audioOK = IsAudioDeviceReady();
     if (audioOK) {
@@ -1976,31 +2026,42 @@ int main(int argc, char **argv) {
     while (!WindowShouldClose()) {
         float dt = fminf(GetFrameTime(), 0.05f);
         int W = GetScreenWidth(), H = GetScreenHeight();
+        pickPad();
+        static int padLogN; if (getenv("TT_PADLOG") && padLogN++ % 15 == 0) {   // test hook: print the gamepad state a few times a second
+            if (padId < 0) fprintf(stderr, "no gamepad\n");
+            else {
+                fprintf(stderr, "pad %d '%s'  LX %+.2f LY %+.2f RX %+.2f RY %+.2f LT %+.2f RT %+.2f  buttons:", padId, GetGamepadName(padId),
+                        GetGamepadAxisMovement(padId, 0), GetGamepadAxisMovement(padId, 1), GetGamepadAxisMovement(padId, 2),
+                        GetGamepadAxisMovement(padId, 3), GetGamepadAxisMovement(padId, 4), GetGamepadAxisMovement(padId, 5));
+                for (int b = 1; b < 18; b++) if (IsGamepadButtonDown(padId, b)) fprintf(stderr, " %d", b);
+                fprintf(stderr, "\n");
+            }
+        }
         if (phase != PH_PLAY) {   // ---- title / join screens
             if (phase == PH_MENU) {
                 if (IsKeyPressed(KEY_ESCAPE)) break;
-                if (IsKeyPressed(KEY_ONE) || IsKeyPressed(KEY_KP_1)) { phase = PH_PLAY; HideCursor(); }
-                if (IsKeyPressed(KEY_TWO) || IsKeyPressed(KEY_KP_2)) {
+                if (IsKeyPressed(KEY_ONE) || IsKeyPressed(KEY_KP_1) || padHit(GAMEPAD_BUTTON_RIGHT_FACE_DOWN)) { phase = PH_PLAY; HideCursor(); }
+                if (IsKeyPressed(KEY_TWO) || IsKeyPressed(KEY_KP_2) || padHit(GAMEPAD_BUTTON_RIGHT_FACE_LEFT)) {
                     if (startHost(NET_PORT)) { phase = PH_PLAY; HideCursor(); } else snprintf(menuMsg, sizeof menuMsg, "Could not start the host (is port %d in use?)", NET_PORT);
                 }
-                if (IsKeyPressed(KEY_THREE) || IsKeyPressed(KEY_KP_3)) { phase = PH_IP; menuMsg[0] = 0; nlan = 0; lanSel = 0; net_lan_scan_start(); }
+                if (IsKeyPressed(KEY_THREE) || IsKeyPressed(KEY_KP_3) || padHit(GAMEPAD_BUTTON_RIGHT_FACE_UP)) { phase = PH_IP; menuMsg[0] = 0; nlan = 0; lanSel = 0; net_lan_scan_start(); }
             } else if (phase == PH_IP) {
                 nlan = net_lan_scan_update(lan, 8);
                 if (lanSel >= nlan) lanSel = nlan ? nlan - 1 : 0;
-                if (IsKeyPressed(KEY_DOWN) && lanSel < nlan - 1) lanSel++;
-                if (IsKeyPressed(KEY_UP) && lanSel > 0) lanSel--;
+                if ((IsKeyPressed(KEY_DOWN) || padHit(GAMEPAD_BUTTON_LEFT_FACE_DOWN)) && lanSel < nlan - 1) lanSel++;
+                if ((IsKeyPressed(KEY_UP) || padHit(GAMEPAD_BUTTON_LEFT_FACE_UP)) && lanSel > 0) lanSel--;
                 int ch;
                 while ((ch = GetCharPressed()) > 0) { int n = (int)strlen(ip); if (n < 90 && ch > 32 && ch < 127) { ip[n] = (char)ch; ip[n + 1] = 0; } }
                 if (IsKeyPressed(KEY_BACKSPACE) && ip[0]) ip[strlen(ip) - 1] = 0;
-                if (IsKeyPressed(KEY_ESCAPE)) { net_lan_scan_stop(); phase = PH_MENU; menuMsg[0] = 0; }
-                if (IsKeyPressed(KEY_ENTER) || IsKeyPressed(KEY_KP_ENTER)) {
+                if (IsKeyPressed(KEY_ESCAPE) || padHit(GAMEPAD_BUTTON_RIGHT_FACE_RIGHT)) { net_lan_scan_stop(); phase = PH_MENU; menuMsg[0] = 0; }
+                if (IsKeyPressed(KEY_ENTER) || IsKeyPressed(KEY_KP_ENTER) || padHit(GAMEPAD_BUTTON_RIGHT_FACE_DOWN)) {
                     char target[96]; snprintf(target, sizeof target, "%s", ip);
                     if (!ip[0] && nlan) snprintf(target, sizeof target, "%s:%d", lan[lanSel].ip, lan[lanSel].port);
                     net_lan_scan_stop();
                     if (startJoin(target)) phase = PH_CONNECT; else snprintf(menuMsg, sizeof menuMsg, "Could not resolve that address");
                 }
             } else if (phase == PH_CONNECT) {
-                if (IsKeyPressed(KEY_ESCAPE)) { net_stop(); netMode = M_SINGLE; phase = PH_MENU; menuMsg[0] = 0; }
+                if (IsKeyPressed(KEY_ESCAPE) || padHit(GAMEPAD_BUTTON_RIGHT_FACE_RIGHT)) { net_stop(); netMode = M_SINGLE; phase = PH_MENU; menuMsg[0] = 0; }
                 clientPoll();
                 if (clientState == 1) { phase = PH_PLAY; HideCursor(); }
                 else if (clientState == 2) { net_stop(); netMode = M_SINGLE; phase = PH_MENU; snprintf(menuMsg, sizeof menuMsg, "%.95s", netStatus); }
@@ -2014,17 +2075,17 @@ int main(int argc, char **argv) {
         cur = me;
         bool netGame = netMode != M_SINGLE;
         if (IsKeyPressed(KEY_ESCAPE)) break;
-        if (IsKeyPressed(KEY_P) && !netGame) paused = !paused;
-        if (IsKeyPressed(KEY_R) && !isClient) { genWorld(); if (isHost) evRestart(); }
+        if ((IsKeyPressed(KEY_P) || padHit(GAMEPAD_BUTTON_MIDDLE_RIGHT)) && !netGame) paused = !paused;
+        if ((IsKeyPressed(KEY_R) || padHit(GAMEPAD_BUTTON_MIDDLE_LEFT)) && !isClient) { genWorld(); if (isHost) evRestart(); }
         if (isHost) { hostPoll(); int np = 0; for (int p = 0; p < MAXP; p++) if (pactive[p]) np++; net_lan_serve_update(np); }
         if (isClient) { clientPoll(); if (clientState == 2) { net_stop(); netMode = M_SINGLE; phase = PH_MENU; ShowCursor(); snprintf(menuMsg, sizeof menuMsg, "%.95s", netStatus); genWorld(); memset(pactive, 0, sizeof pactive); pactive[0] = true; me = 0; cur = 0; continue; } }
         {   // Q/E look around while held; the camera swings back behind the tank when released (C snaps it back)
-            float qe = (IsKeyDown(KEY_E) ? 1 : 0) - (IsKeyDown(KEY_Q) ? 1 : 0);
+            float qe = (IsKeyDown(KEY_E) || padDown(GAMEPAD_BUTTON_RIGHT_TRIGGER_1) ? 1 : 0) - (IsKeyDown(KEY_Q) || padDown(GAMEPAD_BUTTON_LEFT_TRIGGER_1) ? 1 : 0);
             if (qe != 0) camOff += qe * 1.8f * dt;
             else camOff -= camOff * fminf(1, 2.5f * dt);
-            if (IsKeyPressed(KEY_C)) camOff = 0;
+            if (IsKeyPressed(KEY_C) || padHit(GAMEPAD_BUTTON_RIGHT_THUMB)) camOff = 0;
         }
-        camDist = Clamp(camDist - GetMouseWheelMove() * 3, 12, 60);
+        camDist = Clamp(camDist - GetMouseWheelMove() * 3 + ((padDown(GAMEPAD_BUTTON_LEFT_FACE_DOWN) ? 1 : 0) - (padDown(GAMEPAD_BUTTON_LEFT_FACE_UP) ? 1 : 0)) * 30 * dt, 12, 60);
         // camera follows the hull from behind
         camYaw += angDiff(camYaw, tank.h + camOff) * fminf(1, 3 * dt);
         float ch = camDist * 0.55f;
@@ -2039,12 +2100,29 @@ int main(int argc, char **argv) {
         in->brake = IsKeyDown(KEY_SPACE);
         in->cannon = IsMouseButtonDown(MOUSE_BUTTON_LEFT);
         in->mg = IsMouseButtonDown(MOUSE_BUTTON_RIGHT) || IsKeyDown(KEY_LEFT_CONTROL);
-        // mouse -> ground point
-        Ray ray = GetScreenToWorldRay(GetMousePosition(), cam);
-        if (ray.direction.y < -0.02f) {
-            float t = -(ray.position.y - 0.3f) / ray.direction.y;
-            aimPt = Vector3Add(ray.position, Vector3Scale(ray.direction, fminf(t, 600)));
-        } else aimPt = Vector3Add(ray.position, Vector3Scale(ray.direction, 400));
+        if (padId >= 0) {   // left stick drives, triggers fire, A brakes
+            if (in->thr == 0) in->thr = -padAxis(GAMEPAD_AXIS_LEFT_Y);
+            if (in->steer == 0) in->steer = -padAxis(GAMEPAD_AXIS_LEFT_X);
+            in->brake |= padDown(GAMEPAD_BUTTON_RIGHT_FACE_DOWN);
+            in->cannon |= padTrig(GAMEPAD_AXIS_RIGHT_TRIGGER, GAMEPAD_BUTTON_RIGHT_TRIGGER_2);
+            in->mg |= padTrig(GAMEPAD_AXIS_LEFT_TRIGGER, GAMEPAD_BUTTON_LEFT_TRIGGER_2);
+            // right stick moves the crosshair like a mouse: speed grows with the square of the push, so small
+            // nudges are fine adjustments and a full push sweeps the screen in about a second. It stays put when released.
+            float sx = padAxis(GAMEPAD_AXIS_RIGHT_X), sy = padAxis(GAMEPAD_AXIS_RIGHT_Y), m = fminf(1, hypotf(sx, sy));
+            if (m > 0) {
+                if (!padAim) { padCur = GetMousePosition(); padAim = true; }   // pick up from where the mouse left it
+                float v = m * m * 1.2f * H / m;
+                padCur.x = Clamp(padCur.x + sx * v * dt, 0, W - 1); padCur.y = Clamp(padCur.y + sy * v * dt, 0, H - 1);
+            }
+        }
+        { Vector2 md = GetMouseDelta(); if (fabsf(md.x) + fabsf(md.y) > 3) padAim = false; }
+        {   // crosshair (mouse or stick) -> ground point
+            Ray ray = GetScreenToWorldRay(padAim ? padCur : GetMousePosition(), cam);
+            if (ray.direction.y < -0.02f) {
+                float t = -(ray.position.y - 0.3f) / ray.direction.y;
+                aimPt = Vector3Add(ray.position, Vector3Scale(ray.direction, fminf(t, 600)));
+            } else aimPt = Vector3Add(ray.position, Vector3Scale(ray.direction, 400));
+        }
         aimPt.y = 0.3f;
         float ad = hypotf(aimPt.x - tank.x, aimPt.z - tank.z);
         if (ad > 360) { aimPt.x = tank.x + (aimPt.x - tank.x) * 360 / ad; aimPt.z = tank.z + (aimPt.z - tank.z) * 360 / ad; }
